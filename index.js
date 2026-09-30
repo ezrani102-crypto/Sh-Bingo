@@ -1,8 +1,8 @@
 /**
  * ============================================================================
  * SHISHO BINGO — COMPLETE SINGLE-FILE ARCHITECTURE
- * Engine: Node.js HTTP + PostgreSQL (pg) + Telegram Mini App + Serverless Tick
- * Redesign: Mobile-First Glassmorphism (Screenshot 2 Reference)
+ * Engine: Node.js Vanilla HTTP + PostgreSQL (pg) + Telegram Mini App
+ * Module: Complete 100-Cartela Atomic Selection & Live Preview System
  * ============================================================================
  */
 
@@ -25,6 +25,7 @@ const CONFIG = {
   CBE_ACCOUNT: process.env.CBE_ACCOUNT || '1000192837465 (Shisho Games)',
   GAME_STAKE: parseFloat(process.env.GAME_STAKE || '10'),
   MAX_CARTELAS: parseInt(process.env.MAX_CARTELAS || '2', 10),
+  TOTAL_CARTELAS: 100,
   ROOM_CAPACITY: parseInt(process.env.ROOM_CAPACITY || '20', 10),
   HOUSE_FEE_PERCENT: parseFloat(process.env.HOUSE_FEE_PERCENT || '20'),
   MIN_WITHDRAWAL: parseFloat(process.env.MIN_WITHDRAWAL || '50'),
@@ -124,6 +125,7 @@ async function initDatabase() {
       stake DECIMAL(14,2) NOT NULL DEFAULT 10.00,
       capacity INT NOT NULL DEFAULT 20,
       status VARCHAR(16) NOT NULL DEFAULT 'WAITING',
+      starts_at TIMESTAMP WITH TIME ZONE,
       created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
       updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
@@ -145,10 +147,10 @@ async function initDatabase() {
     CREATE TABLE IF NOT EXISTS room_cartelas (
       id SERIAL PRIMARY KEY,
       room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-      cartela_id INTEGER NOT NULL REFERENCES cartelas(id) ON DELETE CASCADE,
+      cartela_number INT NOT NULL,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       purchased_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-      UNIQUE(room_id, cartela_id)
+      UNIQUE(room_id, cartela_number)
     );
 
     CREATE TABLE IF NOT EXISTS games (
@@ -163,7 +165,6 @@ async function initDatabase() {
       total_pot DECIMAL(14,2) NOT NULL DEFAULT 0.00,
       house_fee DECIMAL(14,2) NOT NULL DEFAULT 0.00,
       prize_pool DECIMAL(14,2) NOT NULL DEFAULT 0.00,
-      winning_pattern VARCHAR(32) DEFAULT 'ONE_LINE_OR_CORNERS',
       started_at TIMESTAMP WITH TIME ZONE,
       finished_at TIMESTAMP WITH TIME ZONE
     );
@@ -172,17 +173,9 @@ async function initDatabase() {
       id SERIAL PRIMARY KEY,
       game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      cartela_id INTEGER NOT NULL REFERENCES cartelas(id) ON DELETE CASCADE,
+      cartela_number INT NOT NULL,
       prize_amount DECIMAL(14,2) NOT NULL,
       pattern_matched VARCHAR(64) NOT NULL,
-      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS game_events (
-      id SERIAL PRIMARY KEY,
-      game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
-      event_type VARCHAR(32) NOT NULL,
-      payload JSONB NOT NULL,
       created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
     );
 
@@ -192,22 +185,24 @@ async function initDatabase() {
   `;
   try {
     await query(sql);
-    await seedDefaultCartelas();
+    await seed100DefaultCartelas();
     await ensureDefaultWaitingRoom();
     dbInitialized = true;
+    console.log("Database initialized with 100-Cartela configuration.");
   } catch (err) {
     console.error('Database initialization error:', err);
   }
 }
 
-async function seedDefaultCartelas() {
+// Generates exactly 100 deterministic B-I-N-G-O matrix cards
+async function seed100DefaultCartelas() {
   const res = await query('SELECT COUNT(*) FROM cartelas');
-  if (parseInt(res.rows[0].count, 10) >= 50) return;
+  if (parseInt(res.rows[0].count, 10) >= CONFIG.TOTAL_CARTELAS) return;
 
-  for (let i = 1; i <= 50; i++) {
+  for (let i = 1; i <= CONFIG.TOTAL_CARTELAS; i++) {
     const matrix = generateBingoMatrix(i);
     await query(
-      'INSERT INTO cartelas (cartela_number, matrix) VALUES ($1, $2) ON CONFLICT (cartela_number) DO NOTHING',
+      'INSERT INTO cartelas (cartela_number, matrix) VALUES ($1, $2) ON CONFLICT (cartela_number) DO UPDATE SET matrix = $2',
       [i, JSON.stringify(matrix)]
     );
   }
@@ -217,11 +212,11 @@ async function ensureDefaultWaitingRoom() {
   const res = await query("SELECT id FROM rooms WHERE status = 'WAITING' LIMIT 1");
   if (res.rows.length === 0) {
     const roomNum = 1000 + Math.floor(Math.random() * 9000);
-    await query("INSERT INTO rooms (room_number, stake, capacity, status) VALUES ($1, $2, $3, 'WAITING')", [
-      roomNum,
-      CONFIG.GAME_STAKE,
-      CONFIG.ROOM_CAPACITY,
-    ]);
+    const startsAt = new Date(Date.now() + 60 * 1000); // 60s countdown
+    await query(
+      "INSERT INTO rooms (room_number, stake, capacity, status, starts_at) VALUES ($1, $2, $3, 'WAITING', $4)",
+      [roomNum, CONFIG.GAME_STAKE, CONFIG.ROOM_CAPACITY, startsAt]
+    );
   }
 }
 
@@ -251,7 +246,7 @@ function verifyTelegramInitData(initDataRaw) {
 }
 
 // ============================================================================
-// 4. CORE REPOSITORY (USERS, AUTHORITATIVE WALLETS)
+// 4. CORE REPOSITORY (USERS & AUTHORITATIVE WALLETS)
 // ============================================================================
 async function findOrCreateUser(tgUser, referredByCode = null) {
   const client = await getDbPool().connect();
@@ -318,17 +313,10 @@ async function modifyWalletAtomic(client, { userId, amount, type, referenceId, d
   return newBal.toFixed(2);
 }
 
-function calculatePrizeDistribution(totalPot, feePercent = CONFIG.HOUSE_FEE_PERCENT) {
-  const pot = parseFloat(totalPot);
-  const houseFee = parseFloat(((pot * feePercent) / 100).toFixed(2));
-  const prizePool = parseFloat((pot - houseFee).toFixed(2));
-  return { houseFee, prizePool };
-}
-
 // ============================================================================
-// 5. BINGO MATH & CARTELA MATRIX GENERATION
+// 5. BINGO MATRIX GENERATOR (DETERMINISTIC 1..100)
 // ============================================================================
-function generateBingoMatrix(seed = 1) {
+function generateBingoMatrix(cartelaNumber) {
   function pseudoRandom(s) {
     let t = (s += 0x6d2b79f5);
     t = Math.imul(t ^ (t >>> 15), t | 1);
@@ -336,7 +324,7 @@ function generateBingoMatrix(seed = 1) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   }
 
-  let localSeed = seed * 1337;
+  let localSeed = cartelaNumber * 2654435761;
   function getSample(min, max, count) {
     const pool = [];
     for (let i = min; i <= max; i++) pool.push(i);
@@ -356,7 +344,7 @@ function generateBingoMatrix(seed = 1) {
     O: getSample(61, 75, 5),
   };
 
-  cols.N[2] = 0; // FREE Center cell
+  cols.N[2] = 0; // FREE Spot in Center
 
   const grid = [];
   for (let r = 0; r < 5; r++) {
@@ -377,63 +365,177 @@ function generateDrawSequence() {
 }
 
 // ============================================================================
-// 6. ROOM ORCHESTRATION & PERSISTENT CARTELA LOCKING
+// 6. ATOMIC CARTELA TOGGLE (SELECTION, DESELECTION & CONCURRENCY)
 // ============================================================================
-async function purchaseCartelasAtomic(userId, roomId, cartelaIds) {
-  if (!Array.isArray(cartelaIds) || cartelaIds.length === 0) throw new Error('NO_CARTELAS_SELECTED');
-  if (cartelaIds.length > CONFIG.MAX_CARTELAS) throw new Error(`EXCEEDS_MAX_CARTELAS_${CONFIG.MAX_CARTELAS}`);
+async function toggleCartelaAtomic(userId, roomId, cartelaNum) {
+  const cNum = parseInt(cartelaNum, 10);
+  if (isNaN(cNum) || cNum < 1 || cNum > CONFIG.TOTAL_CARTELAS) {
+    throw new Error('CARTELA_NOT_FOUND');
+  }
 
+  const client = await getDbPool().connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Lock and Verify Room Status
+    const rRes = await client.query('SELECT * FROM rooms WHERE id = $1 FOR UPDATE', [roomId]);
+    if (rRes.rows.length === 0) throw new Error('ROOM_NOT_FOUND');
+    const room = rRes.rows[0];
+
+    if (room.status === 'PLAYING' || room.status === 'FINISHED') {
+      throw new Error('GAME_ALREADY_STARTED');
+    }
+    if (room.status !== 'WAITING' && room.status !== 'STARTING') {
+      throw new Error('ROOM_NOT_ACCEPTING_CARTELAS');
+    }
+
+    // 2. Check if cartela is already reserved in this room
+    const existingRes = await client.query(
+      'SELECT * FROM room_cartelas WHERE room_id = $1 AND cartela_number = $2 FOR UPDATE',
+      [roomId, cNum]
+    );
+
+    if (existingRes.rows.length > 0) {
+      const reservation = existingRes.rows[0];
+
+      // Cartela belongs to current user -> DESELECT & REFUND
+      if (reservation.user_id === userId) {
+        await client.query('DELETE FROM room_cartelas WHERE id = $1', [reservation.id]);
+
+        // Refund 10 BIRR
+        const newBal = await modifyWalletAtomic(client, {
+          userId,
+          amount: CONFIG.GAME_STAKE,
+          type: 'GAME_REFUND',
+          referenceId: `REFUND_R${roomId}_C${cNum}`,
+          description: `Refund for Cartela #${cNum} in Room #${room.room_number}`,
+        });
+
+        // Check remaining cartelas for user in room
+        const remaining = await client.query(
+          'SELECT cartela_number FROM room_cartelas WHERE room_id = $1 AND user_id = $2',
+          [roomId, userId]
+        );
+        if (remaining.rows.length === 0) {
+          await client.query('DELETE FROM room_players WHERE room_id = $1 AND user_id = $2', [roomId, userId]);
+        }
+
+        await client.query('COMMIT');
+        return {
+          success: true,
+          action: 'deselected',
+          cartela: cNum,
+          refund: CONFIG.GAME_STAKE.toFixed(2),
+          balance: newBal,
+          selectedCartelas: remaining.rows.map((r) => r.cartela_number),
+        };
+      } else {
+        // Taken by another player
+        throw new Error('CARTELA_TAKEN');
+      }
+    }
+
+    // 3. Cartela is AVAILABLE -> SELECT & DEDUCT
+    // Check user's current selections count in this room
+    const userSelections = await client.query(
+      'SELECT cartela_number FROM room_cartelas WHERE room_id = $1 AND user_id = $2',
+      [roomId, userId]
+    );
+    if (userSelections.rows.length >= CONFIG.MAX_CARTELAS) {
+      throw new Error('MAX_CARTELAS_REACHED');
+    }
+
+    // Check Wallet Balance >= 10 BIRR
+    const wRes = await client.query('SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE', [userId]);
+    if (wRes.rows.length === 0) throw new Error('WALLET_UNAVAILABLE');
+    if (parseFloat(wRes.rows[0].balance) < CONFIG.GAME_STAKE) {
+      throw new Error('INSUFFICIENT_BALANCE');
+    }
+
+    // Reserve Cartela with composite UNIQUE protection
+    try {
+      await client.query(
+        'INSERT INTO room_cartelas (room_id, cartela_number, user_id) VALUES ($1, $2, $3)',
+        [roomId, cNum, userId]
+      );
+    } catch (err) {
+      if (err.code === '23505') throw new Error('CARTELA_TAKEN');
+      throw err;
+    }
+
+    // Ensure player entry in room
+    await client.query(
+      'INSERT INTO room_players (room_id, user_id) VALUES ($1, $2) ON CONFLICT (room_id, user_id) DO NOTHING',
+      [roomId, userId]
+    );
+
+    // Deduct 10 BIRR
+    const newBal = await modifyWalletAtomic(client, {
+      userId,
+      amount: -CONFIG.GAME_STAKE,
+      type: 'GAME_STAKE',
+      referenceId: `STAKE_R${roomId}_C${cNum}`,
+      description: `Cartela #${cNum} Room #${room.room_number}`,
+    });
+
+    const activeSelected = userSelections.rows.map((r) => r.cartela_number);
+    activeSelected.push(cNum);
+
+    await client.query('COMMIT');
+    return {
+      success: true,
+      action: 'selected',
+      cartela: cNum,
+      amount: CONFIG.GAME_STAKE.toFixed(2),
+      balance: newBal,
+      selectedCartelas: activeSelected,
+    };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// User leaves waiting room -> Auto-release all their cartelas and refund atomically
+async function leaveRoomAtomic(userId, roomId) {
   const client = await getDbPool().connect();
   try {
     await client.query('BEGIN');
     const rRes = await client.query('SELECT * FROM rooms WHERE id = $1 FOR UPDATE', [roomId]);
     if (rRes.rows.length === 0) throw new Error('ROOM_NOT_FOUND');
     const room = rRes.rows[0];
-    if (room.status !== 'WAITING') throw new Error('ROOM_ALREADY_STARTED');
 
-    const existingPurchases = await client.query(
-      'SELECT cartela_id FROM room_cartelas WHERE room_id = $1 AND user_id = $2',
+    if (room.status === 'PLAYING' || room.status === 'FINISHED') {
+      throw new Error('GAME_ALREADY_STARTED');
+    }
+
+    const ownedRes = await client.query(
+      'SELECT cartela_number FROM room_cartelas WHERE room_id = $1 AND user_id = $2 FOR UPDATE',
       [roomId, userId]
     );
-    if (existingPurchases.rows.length + cartelaIds.length > CONFIG.MAX_CARTELAS) {
-      throw new Error('LIMIT_EXCEEDED');
+    const count = ownedRes.rows.length;
+
+    let updatedBal = await getAuthoritativeWallet(userId);
+
+    if (count > 0) {
+      const refundTotal = parseFloat((count * CONFIG.GAME_STAKE).toFixed(2));
+      await client.query('DELETE FROM room_cartelas WHERE room_id = $1 AND user_id = $2', [roomId, userId]);
+
+      updatedBal = await modifyWalletAtomic(client, {
+        userId,
+        amount: refundTotal,
+        type: 'GAME_REFUND',
+        referenceId: `LEAVE_R${roomId}_COUNT_${count}`,
+        description: `Refund for leaving room #${room.room_number} (${count} cartelas)`,
+      });
     }
 
-    const totalCost = (CONFIG.GAME_STAKE * cartelaIds.length).toFixed(2);
-    const wRes = await client.query('SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE', [userId]);
-    if (wRes.rows.length === 0) throw new Error('WALLET_NOT_FOUND');
-    if (parseFloat(wRes.rows[0].balance) < parseFloat(totalCost)) {
-      throw new Error('INSUFFICIENT_FUNDS');
-    }
-
-    for (const cId of cartelaIds) {
-      try {
-        await client.query('INSERT INTO room_cartelas (room_id, cartela_id, user_id) VALUES ($1, $2, $3)', [
-          roomId,
-          cId,
-          userId,
-        ]);
-      } catch (err) {
-        if (err.code === '23505') throw new Error(`CARTELA_${cId}_ALREADY_TAKEN`);
-        throw err;
-      }
-    }
-
-    await client.query(
-      'INSERT INTO room_players (room_id, user_id) VALUES ($1, $2) ON CONFLICT (room_id, user_id) DO NOTHING',
-      [roomId, userId]
-    );
-
-    const newBal = await modifyWalletAtomic(client, {
-      userId,
-      amount: -parseFloat(totalCost),
-      type: 'GAME_STAKE',
-      referenceId: `ROOM_${roomId}_CARTS_${cartelaIds.join('-')}`,
-      description: `Stake for room #${room.room_number} (${cartelaIds.length} cartelas)`,
-    });
-
+    await client.query('DELETE FROM room_players WHERE room_id = $1 AND user_id = $2', [roomId, userId]);
     await client.query('COMMIT');
-    return { success: true, newBalance: newBal };
+
+    return { success: true, refundedAmount: (count * CONFIG.GAME_STAKE).toFixed(2), balance: updatedBal };
   } catch (e) {
     await client.query('ROLLBACK');
     throw e;
@@ -460,9 +562,14 @@ async function tryAutoStartRoom(roomId) {
     const cCountRes = await client.query('SELECT COUNT(*) FROM room_cartelas WHERE room_id = $1', [roomId]);
     const cartelaCount = parseInt(cCountRes.rows[0].count, 10);
 
-    if (cartelaCount >= 2) {
+    // Auto-advance if 2 or more cartelas are bought and countdown elapsed
+    const now = new Date();
+    const isTimeUp = room.starts_at && now >= new Date(room.starts_at);
+
+    if (cartelaCount >= 2 && isTimeUp) {
       const totalPot = (cartelaCount * CONFIG.GAME_STAKE).toFixed(2);
-      const { houseFee, prizePool } = calculatePrizeDistribution(totalPot);
+      const houseFee = ((totalPot * CONFIG.HOUSE_FEE_PERCENT) / 100).toFixed(2);
+      const prizePool = (totalPot - houseFee).toFixed(2);
       const { sequence, hash } = generateDrawSequence();
 
       await client.query("UPDATE rooms SET status = 'PLAYING', updated_at = NOW() WHERE id = $1", [roomId]);
@@ -480,14 +587,14 @@ async function tryAutoStartRoom(roomId) {
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('Auto start room error:', err);
+    console.error('Auto start error:', err);
   } finally {
     client.release();
   }
 }
 
 // ============================================================================
-// 7. SERVERLESS TICK ENGINE & BINGO VALIDATION
+// 7. GAME TICK DRIVER & BINGO VALIDATION
 // ============================================================================
 async function tickGameEngine(roomId) {
   const client = await getDbPool().connect();
@@ -521,11 +628,6 @@ async function tickGameEngine(roomId) {
           `UPDATE games SET called_numbers = $1, current_index = $2, next_call_at = $3 WHERE id = $4`,
           [JSON.stringify(called), newIndex, newNextCallAt, game.id]
         );
-
-        await client.query(
-          `INSERT INTO game_events (game_id, event_type, payload) VALUES ($1, 'NUMBER_CALLED', $2)`,
-          [game.id, JSON.stringify({ number: nextNum, index: newIndex })]
-        );
       } else {
         await client.query("UPDATE games SET status = 'FINISHED', finished_at = NOW() WHERE id = $1", [game.id]);
         await client.query("UPDATE rooms SET status = 'FINISHED', updated_at = NOW() WHERE id = $2", [roomId]);
@@ -534,7 +636,6 @@ async function tickGameEngine(roomId) {
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('Tick error:', err);
   } finally {
     client.release();
   }
@@ -593,27 +694,26 @@ function verifyBingoPattern(matrix, calledSet) {
   return { won: false, pattern: null };
 }
 
-async function claimBingoAtomic(userId, roomId, cartelaId) {
+async function claimBingoAtomic(userId, roomId, cartelaNum) {
+  const cNum = parseInt(cartelaNum, 10);
   const client = await getDbPool().connect();
   try {
     await client.query('BEGIN');
-    const gRes = await client.query(
-      "SELECT * FROM games WHERE room_id = $1 AND status = 'PLAYING' FOR UPDATE",
-      [roomId]
-    );
+    const gRes = await client.query("SELECT * FROM games WHERE room_id = $1 AND status = 'PLAYING' FOR UPDATE", [
+      roomId,
+    ]);
     if (gRes.rows.length === 0) throw new Error('GAME_NOT_ACTIVE');
     const game = gRes.rows[0];
 
     const rcRes = await client.query(
-      'SELECT * FROM room_cartelas WHERE room_id = $1 AND cartela_id = $2 AND user_id = $3',
-      [roomId, cartelaId, userId]
+      'SELECT * FROM room_cartelas WHERE room_id = $1 AND cartela_number = $2 AND user_id = $3',
+      [roomId, cNum, userId]
     );
     if (rcRes.rows.length === 0) throw new Error('CARTELA_NOT_OWNED');
 
-    const cRes = await client.query('SELECT * FROM cartelas WHERE id = $1', [cartelaId]);
+    const cRes = await client.query('SELECT * FROM cartelas WHERE cartela_number = $1', [cNum]);
     if (cRes.rows.length === 0) throw new Error('CARTELA_NOT_FOUND');
-    const cartela = cRes.rows[0];
-    const matrix = typeof cartela.matrix === 'string' ? JSON.parse(cartela.matrix) : cartela.matrix;
+    const matrix = typeof cRes.rows[0].matrix === 'string' ? JSON.parse(cRes.rows[0].matrix) : cRes.rows[0].matrix;
 
     const called = typeof game.called_numbers === 'string' ? JSON.parse(game.called_numbers) : game.called_numbers;
     const check = verifyBingoPattern(matrix, new Set(called));
@@ -621,20 +721,20 @@ async function claimBingoAtomic(userId, roomId, cartelaId) {
 
     const prizeAmount = parseFloat(game.prize_pool).toFixed(2);
     await client.query(
-      `INSERT INTO game_winners (game_id, user_id, cartela_id, prize_amount, pattern_matched) VALUES ($1, $2, $3, $4, $5)`,
-      [game.id, userId, cartelaId, prizeAmount, check.pattern]
+      `INSERT INTO game_winners (game_id, user_id, cartela_number, prize_amount, pattern_matched) VALUES ($1, $2, $3, $4, $5)`,
+      [game.id, userId, cNum, prizeAmount, check.pattern]
     );
 
     const updatedBal = await modifyWalletAtomic(client, {
       userId,
       amount: parseFloat(prizeAmount),
       type: 'GAME_PRIZE',
-      referenceId: `GAME_${game.id}_WIN_${cartelaId}`,
-      description: `Bingo Prize for Room #${roomId}`,
+      referenceId: `GAME_${game.id}_WIN_${cNum}`,
+      description: `Bingo Prize for Room #${roomId}, Cartela #${cNum}`,
     });
 
     await client.query("UPDATE games SET status = 'FINISHED', finished_at = NOW() WHERE id = $1", [game.id]);
-    await client.query("UPDATE rooms SET status = 'FINISHED', updated_at = NOW() WHERE id = $1", [roomId]);
+    await client.query("UPDATE rooms SET status = 'FINISHED', updated_at = NOW() WHERE id = $2", [roomId]);
     await client.query('COMMIT');
 
     return {
@@ -642,7 +742,7 @@ async function claimBingoAtomic(userId, roomId, cartelaId) {
       prizeAmount,
       updatedBalance: updatedBal,
       pattern: check.pattern,
-      cartelaNumber: cartela.cartela_number,
+      cartelaNumber: cNum,
     };
   } catch (e) {
     await client.query('ROLLBACK');
@@ -653,60 +753,7 @@ async function claimBingoAtomic(userId, roomId, cartelaId) {
 }
 
 // ============================================================================
-// 8. DEPOSIT & WITHDRAWAL REPOSITORY
-// ============================================================================
-async function createDepositAtomic(userId, amount, paymentMethod, transactionId) {
-  const amt = parseFloat(amount);
-  if (isNaN(amt) || amt <= 0) throw new Error('INVALID_AMOUNT');
-  if (!transactionId || !transactionId.trim()) throw new Error('TRANSACTION_ID_REQUIRED');
-
-  const res = await query(
-    `INSERT INTO deposits (user_id, amount, payment_method, transaction_id, status) VALUES ($1, $2, $3, $4, 'PENDING') RETURNING *`,
-    [userId, amt.toFixed(2), paymentMethod, transactionId.trim()]
-  );
-  return res.rows[0];
-}
-
-async function createWithdrawalAtomic(userId, amount, paymentMethod, accountNumber, accountHolder) {
-  const amt = parseFloat(amount);
-  if (isNaN(amt) || amt < CONFIG.MIN_WITHDRAWAL) throw new Error(`MINIMUM_WITHDRAWAL_${CONFIG.MIN_WITHDRAWAL}_BIRR`);
-
-  const client = await getDbPool().connect();
-  try {
-    await client.query('BEGIN');
-    const wRes = await client.query('SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE', [userId]);
-    if (wRes.rows.length === 0) throw new Error('WALLET_NOT_FOUND');
-    const currentBal = parseFloat(wRes.rows[0].balance);
-
-    if (currentBal - amt < CONFIG.MIN_REMAINING_BALANCE) {
-      throw new Error(`MUST_RETAIN_${CONFIG.MIN_REMAINING_BALANCE}_BIRR_FOR_GAMES`);
-    }
-
-    const newBal = await modifyWalletAtomic(client, {
-      userId,
-      amount: -amt,
-      type: 'WITHDRAWAL',
-      referenceId: `WD_${Date.now()}`,
-      description: `Withdrawal request to ${paymentMethod} (${accountNumber})`,
-    });
-
-    const insRes = await client.query(
-      `INSERT INTO withdrawals (user_id, amount, payment_method, account_number, account_holder, status) VALUES ($1, $2, $3, $4, $5, 'PENDING') RETURNING *`,
-      [userId, amt.toFixed(2), paymentMethod, accountNumber, accountHolder]
-    );
-
-    await client.query('COMMIT');
-    return { success: true, withdrawal: insRes.rows[0], newBalance: newBal };
-  } catch (e) {
-    await client.query('ROLLBACK');
-    throw e;
-  } finally {
-    client.release();
-  }
-}
-
-// ============================================================================
-// 9. TELEGRAM BOT ENGINE
+// 8. TELEGRAM BOT ENGINE
 // ============================================================================
 async function sendTelegramMessage(chatId, text, replyMarkup = null) {
   if (!CONFIG.TELEGRAM_BOT_TOKEN || !chatId) return;
@@ -761,20 +808,24 @@ async function handleTelegramWebhook(body) {
   };
 
   if (text.startsWith('/start')) {
-    const welcome = `👑 *SHISHO BINGO*\n_Play. Win. Enjoy!_\n\nWelcome, *${user.display_name}*! Ethiopia's premier real-time multiplayer 5x5 Bingo.\n\nTap *🎮 Play* below to join a live game!`;
+    const welcome = `👑 *SHISHO BINGO*\n_Play. Win. Enjoy!_\n\nWelcome, *${user.display_name}*! Ethiopia's authentic 100-Cartela Bingo experience.\n\nTap *🎮 Play* below to join a live game!`;
     await sendTelegramMessage(chatId, welcome, defaultKeyboard);
     return;
   }
 
   if (text === '💰 Balance') {
     const bal = await getAuthoritativeWallet(user.id);
-    await sendTelegramMessage(chatId, `💰 *Available Balance:* *${bal} BIRR*\n_Live synced with your mini app._`, defaultKeyboard);
+    await sendTelegramMessage(
+      chatId,
+      `💰 *Available Balance:* *${bal} BIRR*\n_Live synced with your mini app._`,
+      defaultKeyboard
+    );
     return;
   }
 }
 
 // ============================================================================
-// 10. REST API ROUTER
+// 9. REST API ROUTER & CONTROLLER
 // ============================================================================
 function jsonResponse(res, statusCode, data) {
   res.writeHead(statusCode, {
@@ -796,7 +847,7 @@ async function authenticateRequest(req) {
   }
   // Local/Dev fallback account for direct browser testing outside Telegram WebApp
   if (process.env.NODE_ENV !== 'production' || !CONFIG.TELEGRAM_BOT_TOKEN) {
-    return await findOrCreateUser({ id: 999999999, first_name: 'Test', username: 'tester' });
+    return await findOrCreateUser({ id: 999999999, first_name: 'TestPlayer', username: 'tester' });
   }
   return null;
 }
@@ -838,6 +889,7 @@ async function handleApiRequest(req, res, parsedUrl) {
 
   const authUser = await authenticateRequest(req);
 
+  // Authoritative Wallet Endpoint
   if (req.method === 'GET' && pathname === '/api/wallet') {
     if (!authUser) return jsonResponse(res, 401, { success: false, error: 'AUTH_REQUIRED' });
     try {
@@ -848,10 +900,11 @@ async function handleApiRequest(req, res, parsedUrl) {
         balance,
       });
     } catch (e) {
-      return jsonResponse(res, 500, { success: false, error: 'WALLET_READ_ERROR', message: e.message });
+      return jsonResponse(res, 500, { success: false, error: 'WALLET_UNAVAILABLE', message: e.message });
     }
   }
 
+  // Active Rooms Feed
   if (req.method === 'GET' && pathname === '/api/rooms') {
     try {
       const roomsRes = await query(`
@@ -861,54 +914,127 @@ async function handleApiRequest(req, res, parsedUrl) {
         FROM rooms r
         LEFT JOIN room_cartelas rc ON rc.room_id = r.id
         LEFT JOIN room_players rp ON rp.room_id = r.id
-        WHERE r.status = 'WAITING'
+        WHERE r.status = 'WAITING' OR r.status = 'STARTING'
         GROUP BY r.id
         ORDER BY r.id ASC
       `);
       return jsonResponse(res, 200, { success: true, rooms: roomsRes.rows });
     } catch (e) {
-      return jsonResponse(res, 500, { success: false, error: 'DATABASE_ERROR', message: e.message });
+      return jsonResponse(res, 500, { success: false, error: 'SERVER_ERROR', message: e.message });
     }
   }
 
-  if (req.method === 'GET' && pathname === '/api/cartelas') {
-    const roomId = parsedUrl.query.roomId;
+  // 100-Cartelas State for Room Endpoint
+  const roomCartelasMatch = pathname.match(/^\/api\/rooms\/(\d+)\/cartelas$/);
+  if (req.method === 'GET' && roomCartelasMatch) {
+    const roomId = parseInt(roomCartelasMatch[1], 10);
     try {
-      const all = await query('SELECT id, cartela_number, matrix FROM cartelas ORDER BY cartela_number ASC');
-      let takenIds = [];
-      let myIds = [];
+      const rRes = await query('SELECT * FROM rooms WHERE id = $1', [roomId]);
+      if (rRes.rows.length === 0) return jsonResponse(res, 404, { success: false, error: 'ROOM_NOT_FOUND' });
+      const room = rRes.rows[0];
 
-      if (roomId) {
-        const takenRes = await query('SELECT cartela_id, user_id FROM room_cartelas WHERE room_id = $1', [roomId]);
-        takenIds = takenRes.rows.map((r) => r.cartela_id);
-        if (authUser) {
-          myIds = takenRes.rows.filter((r) => r.user_id === authUser.id).map((r) => r.cartela_id);
+      // Auto start check
+      await tryAutoStartRoom(roomId);
+
+      const reservations = await query(
+        'SELECT cartela_number, user_id FROM room_cartelas WHERE room_id = $1',
+        [roomId]
+      );
+
+      const userBal = authUser ? await getAuthoritativeWallet(authUser.id) : '0.00';
+      const myCartelas = [];
+      const statusMap = {};
+
+      reservations.rows.forEach((r) => {
+        if (authUser && r.user_id === authUser.id) {
+          statusMap[r.cartela_number] = 'mine';
+          myCartelas.push(r.cartela_number);
+        } else {
+          statusMap[r.cartela_number] = 'taken';
         }
+      });
+
+      const cartelaList = [];
+      for (let i = 1; i <= CONFIG.TOTAL_CARTELAS; i++) {
+        cartelaList.push({
+          number: i,
+          status: statusMap[i] || 'available',
+        });
       }
 
-      return jsonResponse(res, 200, { success: true, cartelas: all.rows, takenCartelaIds: takenIds, myCartelaIds: myIds });
+      // Compute room seconds remaining
+      let secondsLeft = 0;
+      if (room.starts_at) {
+        secondsLeft = Math.max(0, Math.ceil((new Date(room.starts_at).getTime() - Date.now()) / 1000));
+      }
+
+      return jsonResponse(res, 200, {
+        success: true,
+        roomId: room.id,
+        roomNumber: room.room_number,
+        price: room.stake,
+        maxCartelas: CONFIG.MAX_CARTELAS,
+        balance: userBal,
+        roomStatus: room.status,
+        startsInSeconds: secondsLeft,
+        selectedCount: myCartelas.length,
+        selectedCartelas: myCartelas,
+        cartelas: cartelaList,
+      });
     } catch (e) {
-      return jsonResponse(res, 500, { success: false, error: 'DATABASE_ERROR', message: e.message });
+      return jsonResponse(res, 500, { success: false, error: 'SERVER_ERROR', message: e.message });
     }
   }
 
-  if (req.method === 'POST' && pathname === '/api/cartela/purchase') {
+  // Toggle Cartela Endpoint (Select / Deselect)
+  const toggleMatch = pathname.match(/^\/api\/rooms\/(\d+)\/cartelas\/(\d+)\/toggle$/);
+  if (req.method === 'POST' && toggleMatch) {
     if (!authUser) return jsonResponse(res, 401, { success: false, error: 'AUTH_REQUIRED' });
-    let body = '';
-    req.on('data', (c) => (body += c));
-    req.on('end', async () => {
-      try {
-        const { roomId, cartelaIds } = JSON.parse(body);
-        const result = await purchaseCartelasAtomic(authUser.id, roomId, cartelaIds);
-        await tryAutoStartRoom(roomId);
-        return jsonResponse(res, 200, result);
-      } catch (e) {
-        return jsonResponse(res, 409, { success: false, error: 'PURCHASE_FAILED', message: e.message });
-      }
-    });
-    return;
+    const roomId = parseInt(toggleMatch[1], 10);
+    const cartelaNum = parseInt(toggleMatch[2], 10);
+
+    try {
+      const result = await toggleCartelaAtomic(authUser.id, roomId, cartelaNum);
+      await tryAutoStartRoom(roomId);
+      return jsonResponse(res, 200, result);
+    } catch (e) {
+      const code = e.message || 'TRANSACTION_FAILED';
+      const status = code === 'INSUFFICIENT_BALANCE' ? 402 : code === 'CARTELA_TAKEN' ? 409 : 400;
+      return jsonResponse(res, status, { success: false, error: code, message: e.message });
+    }
   }
 
+  // Single Cartela Matrix Preview Endpoint
+  const previewMatch = pathname.match(/^\/api\/cartelas\/(\d+)\/matrix$/);
+  if (req.method === 'GET' && previewMatch) {
+    const cartelaNum = parseInt(previewMatch[1], 10);
+    try {
+      const resC = await query('SELECT cartela_number, matrix FROM cartelas WHERE cartela_number = $1', [cartelaNum]);
+      if (resC.rows.length === 0) return jsonResponse(res, 404, { success: false, error: 'CARTELA_NOT_FOUND' });
+      return jsonResponse(res, 200, {
+        success: true,
+        cartelaNumber: cartelaNum,
+        matrix: typeof resC.rows[0].matrix === 'string' ? JSON.parse(resC.rows[0].matrix) : resC.rows[0].matrix,
+      });
+    } catch (e) {
+      return jsonResponse(res, 500, { success: false, error: 'SERVER_ERROR' });
+    }
+  }
+
+  // Leave Room Endpoint
+  const leaveMatch = pathname.match(/^\/api\/rooms\/(\d+)\/leave$/);
+  if (req.method === 'POST' && leaveMatch) {
+    if (!authUser) return jsonResponse(res, 401, { success: false, error: 'AUTH_REQUIRED' });
+    const roomId = parseInt(leaveMatch[1], 10);
+    try {
+      const resLeave = await leaveRoomAtomic(authUser.id, roomId);
+      return jsonResponse(res, 200, resLeave);
+    } catch (e) {
+      return jsonResponse(res, 400, { success: false, error: e.message });
+    }
+  }
+
+  // Live Game State & Serverless Tick Driver
   if (req.method === 'GET' && pathname === '/api/game/state') {
     const roomId = parsedUrl.query.roomId;
     if (!roomId) return jsonResponse(res, 400, { success: false, error: 'ROOM_ID_REQUIRED' });
@@ -926,11 +1052,10 @@ async function handleApiRequest(req, res, parsedUrl) {
 
       const game = gRes.rows[0];
       const winnersRes = await query(
-        `SELECT gw.*, u.display_name, c.cartela_number FROM game_winners gw 
-         JOIN users u ON u.id = gw.user_id JOIN cartelas c ON c.id = gw.cartela_id WHERE gw.game_id = $1`,
+        `SELECT gw.*, u.display_name FROM game_winners gw 
+         JOIN users u ON u.id = gw.user_id WHERE gw.game_id = $1`,
         [game.id]
       );
-
       const called = typeof game.called_numbers === 'string' ? JSON.parse(game.called_numbers) : game.called_numbers;
 
       return jsonResponse(res, 200, {
@@ -948,18 +1073,19 @@ async function handleApiRequest(req, res, parsedUrl) {
         },
       });
     } catch (e) {
-      return jsonResponse(res, 500, { success: false, error: 'GAME_STATE_ERROR', message: e.message });
+      return jsonResponse(res, 500, { success: false, error: 'SERVER_ERROR', message: e.message });
     }
   }
 
+  // Claim Bingo
   if (req.method === 'POST' && pathname === '/api/game/bingo') {
     if (!authUser) return jsonResponse(res, 401, { success: false, error: 'AUTH_REQUIRED' });
     let body = '';
     req.on('data', (c) => (body += c));
     req.on('end', async () => {
       try {
-        const { roomId, cartelaId } = JSON.parse(body);
-        const result = await claimBingoAtomic(authUser.id, roomId, cartelaId);
+        const { roomId, cartelaNumber } = JSON.parse(body);
+        const result = await claimBingoAtomic(authUser.id, roomId, cartelaNumber);
         return jsonResponse(res, 200, result);
       } catch (e) {
         return jsonResponse(res, 400, { success: false, error: 'BINGO_VERIFY_FAILED', message: e.message });
@@ -968,55 +1094,25 @@ async function handleApiRequest(req, res, parsedUrl) {
     return;
   }
 
-  if (req.method === 'POST' && pathname === '/api/deposit') {
-    if (!authUser) return jsonResponse(res, 401, { success: false, error: 'AUTH_REQUIRED' });
-    let body = '';
-    req.on('data', (c) => (body += c));
-    req.on('end', async () => {
-      try {
-        const { amount, paymentMethod, transactionId } = JSON.parse(body);
-        const dep = await createDepositAtomic(authUser.id, amount, paymentMethod, transactionId);
-        return jsonResponse(res, 200, { success: true, deposit: dep });
-      } catch (e) {
-        return jsonResponse(res, 400, { success: false, error: 'DEPOSIT_FAILED', message: e.message });
-      }
-    });
-    return;
-  }
-
-  if (req.method === 'POST' && pathname === '/api/withdraw') {
-    if (!authUser) return jsonResponse(res, 401, { success: false, error: 'AUTH_REQUIRED' });
-    let body = '';
-    req.on('data', (c) => (body += c));
-    req.on('end', async () => {
-      try {
-        const { amount, paymentMethod, accountNumber, accountHolder } = JSON.parse(body);
-        const resWd = await createWithdrawalAtomic(authUser.id, amount, paymentMethod, accountNumber, accountHolder);
-        return jsonResponse(res, 200, resWd);
-      } catch (e) {
-        return jsonResponse(res, 400, { success: false, error: 'WITHDRAW_FAILED', message: e.message });
-      }
-    });
-    return;
-  }
-
+  // Ledger History
   if (req.method === 'GET' && pathname === '/api/history') {
     if (!authUser) return jsonResponse(res, 401, { success: false, error: 'AUTH_REQUIRED' });
     try {
-      const txs = await query('SELECT * FROM wallet_transactions WHERE user_id = $1 ORDER BY id DESC LIMIT 50', [
-        authUser.id,
-      ]);
+      const txs = await query(
+        'SELECT * FROM wallet_transactions WHERE user_id = $1 ORDER BY id DESC LIMIT 50',
+        [authUser.id]
+      );
       return jsonResponse(res, 200, { success: true, transactions: txs.rows });
     } catch (e) {
-      return jsonResponse(res, 500, { success: false, error: 'DB_ERROR', message: e.message });
+      return jsonResponse(res, 500, { success: false, error: 'SERVER_ERROR', message: e.message });
     }
   }
 
-  return jsonResponse(res, 404, { success: false, error: 'NOT_FOUND' });
+  return jsonResponse(res, 404, { success: false, error: 'ENDPOINT_NOT_FOUND' });
 }
 
 // ============================================================================
-// 11. REDESIGNED EMBEDDED MINI APP (HTML, CSS & JS)
+// 10. EMBEDDED MINI APP FRONTEND (HTML + GLASSMORPHIC CSS + LOGIC)
 // ============================================================================
 function getMiniAppHTML() {
   return `<!DOCTYPE html>
@@ -1030,7 +1126,7 @@ function getMiniAppHTML() {
     :root {
       --bg-dark-1: #080511;
       --bg-dark-2: #0d0718;
-      --bg-card: rgba(23, 16, 36, 0.88);
+      --bg-card: rgba(23, 16, 36, 0.92);
       --bg-card-border: rgba(255, 216, 77, 0.16);
       --primary-gold: #ffc400;
       --bright-gold: #ffd84d;
@@ -1038,116 +1134,105 @@ function getMiniAppHTML() {
       --purple-main: #6c3ccf;
       --purple-bright: #8e5bef;
       --purple-glow: rgba(110, 60, 207, 0.4);
+      --taken-red: #ef4444;
+      --taken-red-bg: rgba(239, 68, 68, 0.18);
       --text-white: #ffffff;
       --text-secondary: #a9a1b8;
       --text-muted: #6f6680;
-      --success: #22c55e;
-      --danger: #ef4444;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; -webkit-tap-highlight-color: transparent; }
     body { background: radial-gradient(circle at 50% 10%, #1a0b30 0%, var(--bg-dark-1) 100%); color: var(--text-white); min-height: 100vh; display: flex; justify-content: center; }
 
-    /* Centered Mobile-First Device Shell */
     .app-viewport { width: 100%; max-width: 460px; min-height: 100vh; position: relative; padding-bottom: 84px; display: flex; flex-direction: column; }
 
     /* Top Gaming Header */
-    .app-header { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; background: rgba(13, 7, 24, 0.85); backdrop-filter: blur(14px); position: sticky; top: 0; z-index: 100; border-bottom: 1px solid var(--bg-card-border); }
+    .app-header { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; background: rgba(13, 7, 24, 0.92); backdrop-filter: blur(14px); position: sticky; top: 0; z-index: 100; border-bottom: 1px solid var(--bg-card-border); }
     .brand-cluster { display: flex; align-items: center; gap: 8px; }
-    .brand-crown { font-size: 20px; filter: drop-shadow(0 0 6px var(--gold-glow)); }
+    .brand-crown { font-size: 22px; filter: drop-shadow(0 0 6px var(--gold-glow)); }
     .brand-title { font-size: 16px; font-weight: 900; letter-spacing: 0.5px; background: linear-gradient(180deg, #fff 0%, var(--bright-gold) 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
     .brand-tag { font-size: 9px; text-transform: uppercase; color: var(--purple-bright); font-weight: 700; letter-spacing: 1px; }
 
-    .balance-pill { background: linear-gradient(135deg, rgba(108, 60, 207, 0.45), rgba(255, 196, 0, 0.12)); border: 1.5px solid var(--primary-gold); padding: 5px 12px; border-radius: 20px; display: flex; align-items: center; gap: 6px; cursor: pointer; box-shadow: 0 0 10px var(--gold-glow); transition: transform 0.15s; }
-    .balance-pill:active { transform: scale(0.96); }
+    .balance-pill { background: linear-gradient(135deg, rgba(108, 60, 207, 0.45), rgba(255, 196, 0, 0.12)); border: 1.5px solid var(--primary-gold); padding: 5px 12px; border-radius: 20px; display: flex; align-items: center; gap: 6px; cursor: pointer; box-shadow: 0 0 10px var(--gold-glow); }
     .balance-text { font-size: 13px; font-weight: 800; color: var(--bright-gold); }
 
-    /* Screen Views */
+    /* Views */
     .screen-view { display: none; padding: 14px 16px; animation: screenFade 0.2s ease-in-out; }
     .screen-view.active { display: block; }
     @keyframes screenFade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
-    /* Reusable Cards & Components */
-    .hero-banner { background: linear-gradient(135deg, rgba(110, 60, 207, 0.4) 0%, rgba(26, 16, 48, 0.8) 100%); border: 1.5px solid rgba(255, 196, 0, 0.28); border-radius: 18px; padding: 18px; text-align: center; position: relative; overflow: hidden; margin-bottom: 16px; box-shadow: 0 6px 20px rgba(0,0,0,0.5); }
-    .hero-banner::before { content: ''; position: absolute; top: -50%; left: -50%; width: 200%; height: 200%; background: radial-gradient(circle, var(--gold-glow) 0%, transparent 60%); opacity: 0.15; pointer-events: none; }
-    .hero-title { font-size: 24px; font-weight: 900; color: var(--bright-gold); text-transform: uppercase; letter-spacing: 1px; }
-    .hero-subtitle { font-size: 13px; color: var(--text-secondary); margin-top: 4px; }
-    .hero-tags { display: flex; justify-content: center; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
-    .hero-badge { background: rgba(0, 0, 0, 0.35); border: 1px solid rgba(255, 255, 255, 0.1); padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; color: var(--text-white); }
+    /* 100-Cartela Screen Specifics */
+    .room-header-meta { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .meta-box { background: var(--bg-card); border: 1px solid var(--bg-card-border); border-radius: 12px; padding: 8px 12px; text-align: center; flex: 1; margin: 0 3px; }
+    .meta-lbl { font-size: 9px; color: var(--text-muted); font-weight: 700; text-transform: uppercase; }
+    .meta-val { font-size: 13px; font-weight: 900; color: var(--bright-gold); }
 
-    .quick-actions-bar { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 16px; }
-    .action-button { background: var(--bg-card); border: 1px solid var(--bg-card-border); border-radius: 14px; padding: 10px 4px; display: flex; flex-direction: column; align-items: center; gap: 4px; cursor: pointer; transition: transform 0.1s, border-color 0.15s; }
-    .action-button:active { transform: scale(0.95); border-color: var(--primary-gold); }
-    .action-icon { font-size: 18px; }
-    .action-label { font-size: 11px; font-weight: 700; color: var(--text-secondary); }
+    /* Visual Legend */
+    .cartela-legend { display: flex; justify-content: center; gap: 14px; background: rgba(0,0,0,0.3); border-radius: 12px; padding: 8px; margin-bottom: 12px; font-size: 11px; font-weight: 700; border: 1px solid var(--bg-card-border); }
+    .legend-item { display: flex; align-items: center; gap: 5px; }
 
-    /* Bingo Room Cards */
-    .section-title { font-size: 14px; font-weight: 800; color: var(--bright-gold); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; }
-    .room-card-v2 { background: var(--bg-card); border: 1.5px solid var(--bg-card-border); border-radius: 16px; padding: 14px 16px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 4px 14px rgba(0,0,0,0.3); }
-    .room-card-v2:hover { border-color: var(--primary-gold); }
-    .room-header-tag { font-size: 15px; font-weight: 800; color: #fff; margin-bottom: 6px; }
-    .room-specs { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--text-secondary); }
-    .room-specs strong { color: var(--bright-gold); }
+    /* The 100 Number Badge Grid */
+    .cartela-100-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-bottom: 16px; max-height: 380px; overflow-y: auto; padding: 4px; scrollbar-width: thin; scrollbar-color: var(--purple-main) transparent; }
+    
+    .badge-cartela { aspect-ratio: 1.25; background: var(--bg-card); border: 1.5px solid rgba(255,255,255,0.08); border-radius: 10px; display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; transition: all 0.15s ease; position: relative; user-select: none; }
+    .badge-cartela:active { transform: scale(0.92); }
+    .badge-cartela .c-num { font-size: 15px; font-weight: 900; color: #fff; }
+    .badge-cartela .c-lbl { font-size: 8px; font-weight: 800; text-transform: uppercase; color: var(--text-muted); }
 
-    .btn-gold-cta { background: linear-gradient(180deg, #ffd84d 0%, #ffaa00 100%); color: #090510; border: none; font-weight: 900; font-size: 13px; padding: 10px 18px; border-radius: 12px; cursor: pointer; text-transform: uppercase; box-shadow: 0 3px 12px var(--gold-glow); transition: transform 0.1s; }
-    .btn-gold-cta:active { transform: scale(0.96); }
+    /* State: MINE (Selected by Authenticated User) */
+    .badge-cartela.mine { background: linear-gradient(135deg, rgba(255,196,0,0.25) 0%, rgba(255,216,77,0.1) 100%); border-color: var(--bright-gold); box-shadow: 0 0 12px var(--gold-glow); }
+    .badge-cartela.mine .c-num { color: var(--bright-gold); }
+    .badge-cartela.mine .c-lbl { color: var(--bright-gold); }
 
-    /* Cartela Selection Tickets Grid */
-    .cartela-grid-container { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin: 12px 0; }
-    .ticket-card { background: rgba(23, 16, 36, 0.95); border: 1.5px solid rgba(255,255,255,0.08); border-radius: 14px; padding: 10px; cursor: pointer; transition: all 0.15s ease; position: relative; }
-    .ticket-card.selected { border-color: var(--primary-gold); background: rgba(255, 196, 0, 0.08); box-shadow: 0 0 12px var(--gold-glow); }
-    .ticket-card.taken { opacity: 0.25; cursor: not-allowed; }
-    .ticket-header { display: flex; justify-content: space-between; font-size: 12px; font-weight: 800; color: var(--bright-gold); margin-bottom: 6px; }
-    .ticket-mini-matrix { display: grid; grid-template-columns: repeat(5, 1fr); gap: 2px; }
-    .mini-cell { aspect-ratio: 1; background: rgba(255,255,255,0.04); border-radius: 3px; font-size: 8px; display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-weight: 600; }
-    .mini-cell.free-cell { background: var(--purple-main); color: #fff; }
+    /* State: TAKEN (Reserved by another player) */
+    .badge-cartela.taken { background: var(--taken-red-bg); border-color: var(--taken-red); opacity: 0.6; cursor: not-allowed; }
+    .badge-cartela.taken .c-num { color: var(--taken-red); }
+    .badge-cartela.taken .c-lbl { color: var(--taken-red); }
 
-    /* Live Bingo Screen (Screenshot 2 Match) */
-    .live-game-header-bar { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; background: var(--bg-card); border: 1px solid var(--bg-card-border); border-radius: 14px; padding: 8px; text-align: center; margin-bottom: 12px; }
-    .stat-label { font-size: 9px; text-transform: uppercase; color: var(--text-muted); font-weight: 700; }
-    .stat-val { font-size: 14px; font-weight: 900; color: var(--bright-gold); }
+    /* State: LOADING */
+    .badge-cartela.loading { pointer-events: none; opacity: 0.7; }
+    .badge-cartela.loading::after { content: ''; width: 14px; height: 14px; border: 2px solid var(--bright-gold); border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; position: absolute; }
+    @keyframes spin { to { transform: rotate(360deg); } }
 
-    .ball-caller-podium { background: radial-gradient(circle at 50% 50%, rgba(108, 60, 207, 0.45) 0%, rgba(10, 5, 20, 0) 70%); border: 2px solid var(--purple-main); border-radius: 20px; padding: 16px; text-align: center; margin-bottom: 12px; position: relative; }
+    /* Dynamic Cartela Live Previews */
+    .preview-section-title { font-size: 12px; font-weight: 800; color: var(--bright-gold); text-transform: uppercase; margin: 14px 0 8px 0; display: flex; align-items: center; justify-content: space-between; }
+    .cartela-preview-board { background: var(--bg-card); border: 1.5px solid var(--primary-gold); border-radius: 14px; padding: 12px; margin-bottom: 14px; box-shadow: 0 4px 16px rgba(0,0,0,0.5); }
+    .preview-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 12px; font-weight: 900; color: var(--bright-gold); }
+    .matrix-5x5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; }
+    .col-lbl { text-align: center; font-weight: 900; color: var(--bright-gold); font-size: 14px; padding-bottom: 2px; }
+    .cell-val { aspect-ratio: 1; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 800; color: #fff; }
+    .cell-val.free { background: linear-gradient(135deg, var(--primary-gold) 0%, #ff8c00 100%); color: #000; font-size: 9px; font-weight: 900; }
+    .cell-val.marked { background: linear-gradient(135deg, var(--purple-main) 0%, var(--purple-bright) 100%); border-color: var(--bright-gold); box-shadow: 0 0 6px var(--purple-glow); }
+
+    /* Sticky Bottom Summary */
+    .sticky-summary-bar { background: rgba(13, 7, 24, 0.96); backdrop-filter: blur(14px); border: 1.5px solid var(--bg-card-border); border-radius: 16px; padding: 12px 16px; margin-top: 10px; display: flex; justify-content: space-between; align-items: center; }
+    .btn-gold-cta { background: linear-gradient(180deg, #ffd84d 0%, #ffaa00 100%); color: #090510; border: none; font-weight: 900; font-size: 13px; padding: 10px 18px; border-radius: 12px; cursor: pointer; text-transform: uppercase; box-shadow: 0 3px 12px var(--gold-glow); }
+    .btn-gold-cta:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* Live Game Caller Podium */
+    .ball-caller-podium { background: radial-gradient(circle at 50% 50%, rgba(108, 60, 207, 0.45) 0%, rgba(10, 5, 20, 0) 70%); border: 2px solid var(--purple-main); border-radius: 20px; padding: 16px; text-align: center; margin-bottom: 12px; }
     .ball-halo { width: 84px; height: 84px; border-radius: 50%; background: linear-gradient(135deg, #ffd84d 0%, #ff8c00 100%); margin: 0 auto; display: flex; flex-direction: column; align-items: center; justify-content: center; box-shadow: 0 0 24px var(--gold-glow); animation: pulseBall 1.5s infinite alternate; }
     @keyframes pulseBall { from { transform: scale(0.96); } to { transform: scale(1.03); } }
-    .ball-letter { font-size: 13px; font-weight: 900; color: rgba(0, 0, 0, 0.7); line-height: 1; }
-    .ball-digit { font-size: 36px; font-weight: 900; color: #000; line-height: 1; }
+    .ball-letter { font-size: 13px; font-weight: 900; color: rgba(0, 0, 0, 0.7); }
+    .ball-digit { font-size: 36px; font-weight: 900; color: #000; }
 
-    .recent-calls-strip { display: flex; gap: 8px; justify-content: center; overflow-x: auto; padding: 8px 0; margin-bottom: 12px; scrollbar-width: none; }
-    .recent-pill { width: 34px; height: 34px; border-radius: 50%; background: var(--bg-card); border: 1.5px solid var(--primary-gold); color: #fff; font-size: 12px; font-weight: 800; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+    /* Toast Notification */
+    .toast-msg { position: fixed; top: 70px; left: 50%; transform: translateX(-50%); background: rgba(13, 7, 24, 0.95); border: 1.5px solid var(--primary-gold); padding: 8px 16px; border-radius: 20px; font-size: 12px; font-weight: 800; color: #fff; z-index: 250; display: none; box-shadow: 0 4px 16px var(--gold-glow); }
 
-    /* Interactive 5x5 Bingo Matrix */
-    .cartela-board { background: var(--bg-card); border: 1.5px solid var(--bg-card-border); border-radius: 16px; padding: 10px; margin-bottom: 12px; }
-    .board-header { font-size: 12px; font-weight: 800; color: var(--bright-gold); text-align: center; margin-bottom: 8px; }
-    .matrix-5x5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; }
-    .col-letter { text-align: center; font-weight: 900; color: var(--bright-gold); font-size: 15px; padding-bottom: 4px; }
-    .cell-val { aspect-ratio: 1; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 800; color: #fff; }
-    .cell-val.marked { background: linear-gradient(135deg, var(--purple-main) 0%, var(--purple-bright) 100%); color: #fff; border-color: var(--bright-gold); box-shadow: 0 0 8px var(--purple-glow); }
-    .cell-val.free-spot { background: linear-gradient(135deg, var(--primary-gold) 0%, #ff8c00 100%); color: #000; font-size: 10px; font-weight: 900; }
-
-    /* Winner Overlay Celebration Screen */
-    .winner-overlay { position: fixed; inset: 0; background: rgba(5, 2, 12, 0.94); backdrop-filter: blur(12px); display: none; flex-direction: column; align-items: center; justify-content: center; z-index: 200; padding: 24px; text-align: center; }
-    .winner-overlay.active { display: flex; animation: zoomIn 0.3s cubic-bezier(0.18, 0.89, 0.32, 1.28); }
-    @keyframes zoomIn { from { transform: scale(0.85); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-
-    /* Bottom Navigation Bar */
+    /* Nav Bar */
     .app-bottom-nav { position: fixed; bottom: 0; left: 50%; transform: translateX(-50%); width: 100%; max-width: 460px; height: 68px; background: rgba(13, 7, 24, 0.95); backdrop-filter: blur(16px); border-top: 1.5px solid var(--bg-card-border); border-top-left-radius: 18px; border-top-right-radius: 18px; display: flex; justify-content: space-around; align-items: center; z-index: 99; }
     .nav-btn { display: flex; flex-direction: column; align-items: center; gap: 4px; background: none; border: none; color: var(--text-muted); cursor: pointer; flex: 1; }
     .nav-btn.active { color: var(--bright-gold); }
     .nav-btn svg { width: 22px; height: 22px; fill: currentColor; }
-    .nav-btn-text { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; }
-
-    /* Forms & Interactive Modals */
-    .form-group { margin-bottom: 12px; }
-    .form-label { font-size: 11px; font-weight: 700; color: var(--text-secondary); margin-bottom: 4px; display: block; }
-    .input-box { width: 100%; padding: 12px 14px; border-radius: 12px; background: rgba(255, 255, 255, 0.05); border: 1.5px solid var(--bg-card-border); color: #fff; font-size: 14px; }
-    .input-box:focus { outline: none; border-color: var(--primary-gold); }
+    .nav-btn-text { font-size: 10px; font-weight: 800; text-transform: uppercase; }
   </style>
 </head>
 <body>
 
   <div class="app-viewport">
     
-    <!-- Top Header -->
+    <div id="toast-bar" class="toast-msg"></div>
+
+    <!-- Header -->
     <header class="app-header">
       <div class="brand-cluster">
         <span class="brand-crown">👑</span>
@@ -1162,247 +1247,125 @@ function getMiniAppHTML() {
       </div>
     </header>
 
-    <!-- VIEW 1: HOME / LOBBY -->
+    <!-- VIEW 1: LOBBY / ROOMS -->
     <main id="view-home" class="screen-view active">
-      <div class="hero-banner">
+      <div style="background: linear-gradient(135deg, rgba(110,60,207,0.4) 0%, rgba(26,16,48,0.8) 100%); border: 1.5px solid rgba(255,196,0,0.28); border-radius: 18px; padding: 18px; text-align: center; margin-bottom: 16px;">
         <div style="font-size: 32px; margin-bottom: 6px;">👑</div>
-        <div class="hero-title">SHISHO BINGO</div>
-        <div class="hero-subtitle">Ethiopia's #1 Real-Time Multiplayer Network</div>
-        <div class="hero-tags">
-          <span class="hero-badge">⚡ Instant Payouts</span>
-          <span class="hero-badge">🔒 100% Fair Draw</span>
-          <span class="hero-badge">👥 Active Rooms</span>
-        </div>
+        <div style="font-size: 22px; font-weight: 900; color: var(--bright-gold);">AUTHENTIC 100 CARTELAS</div>
+        <div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px;">Choose your lucky tickets. Max 2 per player.</div>
       </div>
 
-      <!-- Quick Actions Strip -->
-      <div class="quick-actions-bar">
-        <div class="action-button" onclick="switchView('wallet')">
-          <div class="action-icon">💳</div>
-          <div class="action-label" data-i18n="deposit">Deposit</div>
-        </div>
-        <div class="action-button" onclick="switchView('wallet')">
-          <div class="action-icon">💸</div>
-          <div class="action-label" data-i18n="withdraw">Withdraw</div>
-        </div>
-        <div class="action-button" onclick="switchView('invite')">
-          <div class="action-icon">🎁</div>
-          <div class="action-label" data-i18n="invite">Invite</div>
-        </div>
-        <div class="action-button" onclick="switchView('profile')">
-          <div class="action-icon">👤</div>
-          <div class="action-label" data-i18n="profile">Profile</div>
-        </div>
-      </div>
-
-      <!-- Available Rooms -->
-      <div class="section-title">
-        <span data-i18n="availableRooms">Available Rooms</span>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+        <span style="font-size: 13px; font-weight: 800; color: var(--bright-gold);">WAITING ROOMS</span>
         <span style="font-size: 11px; color: var(--purple-bright); cursor: pointer;" onclick="loadRooms()">🔄 Refresh</span>
       </div>
-      <div id="rooms-feed-list">
-        <!-- Rendered via loadRooms() -->
-      </div>
+      <div id="rooms-feed-list"></div>
     </main>
 
-    <!-- VIEW 2: CARTELA SELECTION TICKET LOBBY -->
+    <!-- VIEW 2: 100-CARTELA SELECTION SCREEN (Screenshot 2 Match) -->
     <section id="view-cartela-picker" class="screen-view">
-      <div class="section-title">
-        <span>Select Tickets (Max 2)</span>
-        <span style="color: var(--text-muted); font-size: 12px;" id="picker-room-info">Room #0000</span>
-      </div>
-      <div style="font-size: 12px; color: var(--text-secondary); margin-bottom: 10px;">
-        Stake: <strong style="color: var(--bright-gold);">10 BIRR</strong> per cartela.
+      <div class="room-header-meta">
+        <div class="meta-box">
+          <div class="meta-lbl">BALANCE</div>
+          <div class="meta-val" id="picker-bal">0.00</div>
+        </div>
+        <div class="meta-box">
+          <div class="meta-lbl">COST</div>
+          <div class="meta-val" id="picker-cost">0.00</div>
+        </div>
+        <div class="meta-box">
+          <div class="meta-lbl">POT</div>
+          <div class="meta-val" id="picker-pot">0.00</div>
+        </div>
+        <div class="meta-box">
+          <div class="meta-lbl">STARTS IN</div>
+          <div class="meta-val" id="picker-countdown">00s</div>
+        </div>
       </div>
 
-      <div class="cartela-grid-container" id="cartela-selectable-feed">
-        <!-- Injected Ticket Previews -->
+      <!-- Legend -->
+      <div class="cartela-legend">
+        <div class="legend-item"><span style="color:var(--text-muted);">🟣</span> Available</div>
+        <div class="legend-item"><span style="color:var(--bright-gold);">🟡</span> Mine</div>
+        <div class="legend-item"><span style="color:var(--taken-red);">🔴</span> Taken</div>
       </div>
 
-      <div style="background: var(--bg-card); border: 1.5px solid var(--bg-card-border); border-radius: 14px; padding: 12px; margin-top: 14px;">
-        <div style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 6px;">
-          <span>Selected Count:</span>
-          <strong id="summary-cartela-count" style="color: var(--bright-gold);">0 / 2</strong>
+      <!-- 100 Cartela Grid Container -->
+      <div class="cartela-100-grid" id="cartelas-badge-grid"></div>
+
+      <!-- Dynamic Real-Time Previews of Selected Cartelas -->
+      <div class="preview-section-title">
+        <span>Cartela Live Preview</span>
+        <span id="preview-count-label" style="font-size: 11px; color: var(--text-muted);">0 Cartelas Selected</span>
+      </div>
+      <div id="cartela-previews-container">
+        <div style="text-align: center; padding: 18px; color: var(--text-muted); font-size: 12px; background: rgba(0,0,0,0.25); border-radius: 12px;">
+          Select any available cartela above to preview its 5x5 numbers.
         </div>
-        <div style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 12px;">
-          <span>Total Deduction:</span>
-          <strong id="summary-total-cost" style="color: var(--bright-gold);">0.00 BIRR</strong>
+      </div>
+
+      <!-- Bottom Sticky Action Bar -->
+      <div class="sticky-summary-bar">
+        <div>
+          <div style="font-size: 11px; color: var(--text-secondary);">Selected: <strong id="summary-badge-count" style="color:var(--bright-gold);">0/2</strong></div>
+          <div style="font-size: 13px; font-weight: 900; color: #fff;" id="summary-total-cost">Total: 0 BIRR</div>
         </div>
-        <button class="btn-gold-cta" style="width: 100%;" onclick="confirmCartelaPurchase()">CONFIRM & JOIN GAME</button>
+        <div style="display: flex; gap: 8px;">
+          <button class="btn-gold-cta" style="background: rgba(255,255,255,0.08); color: #fff;" onclick="leaveCurrentRoom()">← Leave</button>
+          <button class="btn-gold-cta" id="btn-continue-game" onclick="proceedToGameSession()">Join Game →</button>
+        </div>
       </div>
     </section>
 
-    <!-- VIEW 3: LIVE BINGO GAME ROOM -->
+    <!-- VIEW 3: LIVE BINGO GAME -->
     <section id="view-live-game" class="screen-view">
-      <!-- Live Game Header -->
-      <div class="live-game-header-bar">
-        <div>
-          <div class="stat-label">POT</div>
-          <div class="stat-val" id="game-pot-val">0</div>
+      <div class="room-header-meta">
+        <div class="meta-box">
+          <div class="meta-lbl">ROOM</div>
+          <div class="meta-val" id="live-room-num">#0</div>
         </div>
-        <div>
-          <div class="stat-label">PLAYERS</div>
-          <div class="stat-val" id="game-players-val">0</div>
+        <div class="meta-box">
+          <div class="meta-lbl">PRIZE POT</div>
+          <div class="meta-val" id="live-pot">0.00</div>
         </div>
-        <div>
-          <div class="stat-label">STAKE</div>
-          <div class="stat-val">10</div>
-        </div>
-        <div>
-          <div class="stat-label">CALL #</div>
-          <div class="stat-val" id="game-call-index">0</div>
+        <div class="meta-box">
+          <div class="meta-lbl">CALL #</div>
+          <div class="meta-val" id="live-call-idx">0</div>
         </div>
       </div>
 
-      <!-- Current Ball Caller Podium -->
       <div class="ball-caller-podium">
         <div class="ball-halo">
-          <div class="ball-letter" id="current-ball-letter">-</div>
-          <div class="ball-digit" id="current-ball-number">-</div>
+          <div class="ball-letter" id="live-ball-ltr">-</div>
+          <div class="ball-digit" id="live-ball-num">-</div>
         </div>
-        <div style="font-size: 11px; color: var(--bright-gold); margin-top: 8px;" id="game-next-timer">Next Call: 5s</div>
+        <div style="font-size: 11px; color: var(--bright-gold); margin-top: 8px;" id="live-timer-text">Next call: 5s</div>
       </div>
 
-      <!-- Recent Number Ribbon -->
-      <div class="recent-calls-strip" id="recent-calls-ribbon"></div>
+      <!-- Live User Board Area -->
+      <div id="live-boards-deck"></div>
 
-      <!-- My Active Cartela Boards -->
-      <div id="live-cartelas-container"></div>
-
-      <button class="btn-gold-cta" style="width: 100%; margin-top: 8px;" onclick="claimBingoVictory()">🏆 BINGO!</button>
+      <button class="btn-gold-cta" style="width: 100%; margin-top: 10px;" onclick="claimBingoVictory()">🏆 CLAIM BINGO!</button>
     </section>
 
     <!-- VIEW 4: WALLET -->
     <section id="view-wallet" class="screen-view">
-      <div class="hero-banner" style="padding: 14px;">
+      <div style="background: var(--bg-card); border: 1.5px solid var(--primary-gold); border-radius: 18px; padding: 20px; text-align: center; margin-bottom: 16px;">
         <div style="font-size: 11px; text-transform: uppercase; color: var(--text-secondary);">Authoritative Balance</div>
-        <div style="font-size: 32px; font-weight: 900; color: var(--bright-gold); margin: 6px 0;" id="wallet-balance-big">0.00 BIRR</div>
-        <div style="font-size: 11px; color: var(--text-muted);">Synchronized across Bot & Mini App</div>
-      </div>
-
-      <div class="section-title"><span>Deposit Funds</span></div>
-      <div style="background: var(--bg-card); border: 1.5px solid var(--bg-card-border); border-radius: 14px; padding: 14px; margin-bottom: 16px;">
-        <div class="form-group">
-          <label class="form-label">Payment Method</label>
-          <select class="input-box" id="inp-dep-method">
-            <option value="TELEBIRR">Telebirr (${CONFIG.TELEBIRR_ACCOUNT})</option>
-            <option value="CBE">CBE (${CONFIG.CBE_ACCOUNT})</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label class="form-label">Amount (BIRR)</label>
-          <input type="number" class="input-box" id="inp-dep-amt" placeholder="e.g. 100">
-        </div>
-        <div class="form-group">
-          <label class="form-label">Transaction Reference ID</label>
-          <input type="text" class="input-box" id="inp-dep-txid" placeholder="Paste bank confirmation code">
-        </div>
-        <button class="btn-gold-cta" style="width: 100%;" onclick="submitDepositOrder()">Submit Deposit</button>
-      </div>
-
-      <div class="section-title"><span>Withdraw Funds</span></div>
-      <div style="background: var(--bg-card); border: 1.5px solid var(--bg-card-border); border-radius: 14px; padding: 14px;">
-        <div class="form-group">
-          <label class="form-label">Payout Method</label>
-          <select class="input-box" id="inp-wd-method">
-            <option value="TELEBIRR">Telebirr</option>
-            <option value="CBE">Commercial Bank of Ethiopia</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label class="form-label">Amount (Min ${CONFIG.MIN_WITHDRAWAL} BIRR)</label>
-          <input type="number" class="input-box" id="inp-wd-amt" placeholder="Amount">
-        </div>
-        <div class="form-group">
-          <label class="form-label">Account / Phone Number</label>
-          <input type="text" class="input-box" id="inp-wd-acc" placeholder="Target Account">
-        </div>
-        <div class="form-group">
-          <label class="form-label">Account Holder Full Name</label>
-          <input type="text" class="input-box" id="inp-wd-name" placeholder="Full Name">
-        </div>
-        <button class="btn-gold-cta" style="width: 100%; background: linear-gradient(180deg, var(--purple-bright) 0%, var(--purple-main) 100%); color: #fff;" onclick="submitWithdrawOrder()">Request Cashout</button>
+        <div style="font-size: 34px; font-weight: 900; color: var(--bright-gold); margin: 6px 0;" id="wallet-big-bal">0.00 BIRR</div>
+        <div style="font-size: 11px; color: var(--text-muted);">Synchronized with PostgreSQL</div>
       </div>
     </section>
 
-    <!-- VIEW 5: HISTORY -->
-    <section id="view-history" class="screen-view">
-      <div class="section-title"><span>Transaction Ledger</span></div>
-      <div id="history-audit-list"></div>
-    </section>
-
-    <!-- VIEW 6: PROFILE & SETTINGS -->
-    <section id="view-profile" class="screen-view">
-      <div class="hero-banner" style="text-align: left; display: flex; align-items: center; gap: 14px;">
-        <div style="width: 54px; height: 54px; border-radius: 50%; background: var(--purple-main); border: 2px solid var(--primary-gold); display: flex; align-items: center; justify-content: center; font-size: 22px;">👤</div>
-        <div>
-          <div style="font-size: 16px; font-weight: 800;" id="prof-display-name">Player</div>
-          <div style="font-size: 12px; color: var(--text-secondary);" id="prof-tg-id">ID: -</div>
-        </div>
-      </div>
-
-      <div class="section-title"><span>Preferences & Audio</span></div>
-      <div style="background: var(--bg-card); border: 1.5px solid var(--bg-card-border); border-radius: 14px; padding: 14px;">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-          <span style="font-size: 13px;">🔊 Caller Voice Synthesizer</span>
-          <input type="checkbox" id="setting-voice" checked style="width: 20px; height: 20px;">
-        </div>
-        <div style="display: flex; justify-content: space-between; align-items: center;">
-          <span style="font-size: 13px;">🌐 Language / ቋንቋ</span>
-          <select id="setting-lang" onchange="changeLanguage(this.value)" class="input-box" style="width: auto; padding: 6px 10px;">
-            <option value="en">English</option>
-            <option value="am">አማርኛ (Amharic)</option>
-          </select>
-        </div>
-      </div>
-    </section>
-
-    <!-- VIEW 7: INVITE FRIENDS -->
-    <section id="view-invite" class="screen-view">
-      <div class="hero-banner">
-        <div style="font-size: 32px; margin-bottom: 6px;">🎁</div>
-        <div class="hero-title">Invite & Earn</div>
-        <div class="hero-subtitle">Receive bonus rewards whenever friends join rooms!</div>
-      </div>
-      <div style="background: var(--bg-card); border: 1.5px solid var(--bg-card-border); border-radius: 14px; padding: 14px; text-align: center;">
-        <input type="text" class="input-box" id="invite-link-input" readonly value="https://t.me/${CONFIG.TELEGRAM_BOT_USERNAME}">
-        <button class="btn-gold-cta" style="width: 100%; margin-top: 10px;" onclick="copyInviteLink()">Copy Invite Link</button>
-      </div>
-    </section>
-
-    <!-- Full-Screen Winner Celebration Modal (Screenshot 2 Match) -->
-    <div id="winner-modal" class="winner-overlay">
-      <div style="font-size: 48px; margin-bottom: 8px;">👑</div>
-      <div style="font-size: 26px; font-weight: 900; color: var(--bright-gold); letter-spacing: 1px;">BINGO!</div>
-      <div style="font-size: 14px; color: #fff; margin-bottom: 16px;">WE HAVE A WINNER!</div>
-      
-      <div style="background: var(--bg-card); border: 2px solid var(--primary-gold); border-radius: 16px; padding: 16px; width: 100%; max-width: 320px; margin-bottom: 16px; box-shadow: 0 0 20px var(--gold-glow);">
-        <div style="font-size: 12px; color: var(--text-secondary); text-transform: uppercase;">Total Prize Pool</div>
-        <div style="font-size: 24px; font-weight: 900; color: var(--bright-gold);" id="win-modal-pot">160 BIRR</div>
-        <div style="margin: 10px 0; border-top: 1px solid var(--bg-card-border);"></div>
-        <div style="font-size: 14px; font-weight: 800;" id="win-modal-winner-name">Winner: -</div>
-        <div style="font-size: 12px; color: var(--text-secondary);" id="win-modal-cartela-num">Cartela: #-</div>
-      </div>
-      <button class="btn-gold-cta" style="width: 100%; max-width: 320px;" onclick="closeWinnerModal()">CONTINUE</button>
-    </div>
-
-    <!-- Bottom Mobile Nav Bar -->
+    <!-- Bottom Nav -->
     <nav class="app-bottom-nav">
       <button class="nav-btn active" id="nav-btn-home" onclick="switchView('home')">
         <svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
-        <span class="nav-btn-text" data-i18n="play">Play</span>
+        <span class="nav-btn-text">Play</span>
       </button>
       <button class="nav-btn" id="nav-btn-wallet" onclick="switchView('wallet')">
         <svg viewBox="0 0 24 24"><path d="M21 18v1c0 1.1-.9 2-2 2H5c-1.11 0-2-.9-2-2V5c0-1.1.89-2 2-2h14c1.1 0 2 .9 2 2v1h-9c-1.11 0-2 .9-2 2v8c0 1.1.89 2 2 2h9zm-9-2h10V8H12v8zm4-2.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5z"/></svg>
-        <span class="nav-btn-text" data-i18n="wallet">Wallet</span>
-      </button>
-      <button class="nav-btn" id="nav-btn-history" onclick="switchView('history')">
-        <svg viewBox="0 0 24 24"><path d="M13 3c-4.97 0-9 4.03-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42C8.27 19.99 10.51 21 13 21c4.97 0 9-4.03 9-9s-4.03-9-9-9zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg>
-        <span class="nav-btn-text" data-i18n="history">History</span>
-      </button>
-      <button class="nav-btn" id="nav-btn-profile" onclick="switchView('profile')">
-        <svg viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
-        <span class="nav-btn-text" data-i18n="profile">Profile</span>
+        <span class="nav-btn-text">Wallet</span>
       </button>
     </nav>
 
@@ -1417,25 +1380,19 @@ function getMiniAppHTML() {
       'Authorization': 'tma ' + (tg?.initData || '')
     };
 
-    const I18N = {
-      en: { play: "Play", wallet: "Wallet", history: "History", profile: "Profile", deposit: "Deposit", withdraw: "Withdraw", invite: "Invite", availableRooms: "Available Rooms" },
-      am: { play: "ተጫወት", wallet: "ዋሌት", history: "ታሪክ", profile: "መገለጫ", deposit: "ገንዘብ አስገባ", withdraw: "ገንዘብ አውጣ", invite: "ይጋብዙ", availableRooms: "የሚገኙ ክፍሎች" }
-    };
-    let currentLang = 'en';
-
-    function changeLanguage(lang) {
-      currentLang = lang;
-      document.querySelectorAll('[data-i18n]').forEach(el => {
-        const key = el.getAttribute('data-i18n');
-        if (I18N[lang] && I18N[lang][key]) el.innerText = I18N[lang][key];
-      });
-    }
-
     let activeRoomId = null;
-    let selectedCartelaIds = [];
-    let cartelasCatalog = [];
-    let gamePollTimer = null;
-    let lastSpokenNumber = null;
+    let activeRoomNumber = null;
+    let mySelectedCartelas = [];
+    let cartelaMatrixCache = {};
+    let pickerSyncInterval = null;
+    let gamePollInterval = null;
+
+    function showToast(text) {
+      const b = document.getElementById('toast-bar');
+      b.innerText = text;
+      b.style.display = 'block';
+      setTimeout(() => { b.style.display = 'none'; }, 2200);
+    }
 
     function switchView(viewName) {
       document.querySelectorAll('.screen-view').forEach(v => v.classList.remove('active'));
@@ -1447,9 +1404,11 @@ function getMiniAppHTML() {
       const navBtn = document.getElementById('nav-btn-' + viewName);
       if (navBtn) navBtn.classList.add('active');
 
-      if (viewName === 'home') loadRooms();
+      if (viewName === 'home') {
+        if (pickerSyncInterval) clearInterval(pickerSyncInterval);
+        loadRooms();
+      }
       if (viewName === 'wallet') refreshWallet();
-      if (viewName === 'history') loadHistory();
     }
 
     async function refreshWallet() {
@@ -1457,11 +1416,9 @@ function getMiniAppHTML() {
         const res = await fetch('/api/wallet', { headers: API_HEADERS });
         const data = await res.json();
         if (data.success) {
-          const bal = data.balance + ' BIRR';
-          document.getElementById('header-wallet-bal').innerText = bal;
-          document.getElementById('wallet-balance-big').innerText = bal;
-          document.getElementById('prof-display-name').innerText = data.user.display_name;
-          document.getElementById('prof-tg-id').innerText = 'ID: ' + data.user.telegram_id;
+          const balText = data.balance + ' BIRR';
+          document.getElementById('header-wallet-bal').innerText = balText;
+          document.getElementById('wallet-big-bal').innerText = balText;
         } else {
           document.getElementById('header-wallet-bal').innerText = 'Unavailable';
         }
@@ -1485,17 +1442,14 @@ function getMiniAppHTML() {
         data.rooms.forEach(r => {
           const pot = (r.selected_cartelas * r.stake).toFixed(2);
           const div = document.createElement('div');
-          div.className = 'room-card-v2';
+          div.style = 'background:var(--bg-card); border:1.5px solid var(--bg-card-border); border-radius:16px; padding:14px; margin-bottom:12px; display:flex; justify-content:space-between; align-items:center;';
           div.innerHTML = \`
             <div>
-              <div class="room-header-tag">🎱 ROOM #\${r.room_number}</div>
-              <div class="room-specs">
-                <span>Stake: <strong>\${r.stake} BIRR</strong></span>
-                <span>Players: <strong>\${r.current_players}/\${r.capacity}</strong></span>
-                <span>Pot: <strong>\${pot} BIRR</strong></span>
-              </div>
+              <div style="font-size:15px; font-weight:800; color:#fff; margin-bottom:4px;">🎱 ROOM #\${r.room_number}</div>
+              <div style="font-size:12px; color:var(--text-secondary);">Stake: <strong style="color:var(--bright-gold);">\${r.stake} BIRR</strong> | Players: <strong>\${r.current_players}/\${r.capacity}</strong></div>
+              <div style="font-size:12px; color:var(--text-secondary);">Pot: <strong style="color:var(--bright-gold);">\${pot} BIRR</strong></div>
             </div>
-            <button class="btn-gold-cta" onclick="openRoomPicker(\${r.id}, \${r.room_number})">JOIN +</button>
+            <button class="btn-gold-cta" onclick="open100CartelaPicker(\${r.id}, \${r.room_number})">JOIN +</button>
           \`;
           container.appendChild(div);
         });
@@ -1504,308 +1458,307 @@ function getMiniAppHTML() {
       }
     }
 
-    async function openRoomPicker(roomId, roomNumber) {
+    // Opens 100-Cartela Screen for Room
+    async function open100CartelaPicker(roomId, roomNumber) {
       activeRoomId = roomId;
-      selectedCartelaIds = [];
-      document.getElementById('picker-room-info').innerText = 'Room #' + roomNumber;
-      updatePurchaseSummary();
-
-      const res = await fetch('/api/cartelas?roomId=' + roomId, { headers: API_HEADERS });
-      const data = await res.json();
-      cartelasCatalog = data.cartelas || [];
-
-      const grid = document.getElementById('cartela-selectable-feed');
-      grid.innerHTML = '';
-
-      cartelasCatalog.slice(0, 16).forEach(c => {
-        const isTaken = data.takenCartelaIds.includes(c.id);
-        const card = document.createElement('div');
-        card.className = 'ticket-card' + (isTaken ? ' taken' : '');
-        card.id = 'cartela-card-' + c.id;
-
-        const matrix = typeof c.matrix === 'string' ? JSON.parse(c.matrix) : c.matrix;
-        let miniMatrixHtml = '';
-        for (let r = 0; r < 5; r++) {
-          for (let col = 0; col < 5; col++) {
-            const v = matrix[r][col];
-            miniMatrixHtml += \`<div class="mini-cell \${v === 0 ? 'free-cell' : ''}">\${v === 0 ? 'F' : v}</div>\`;
-          }
-        }
-
-        card.innerHTML = \`
-          <div class="ticket-header">
-            <span>Ticket #\${c.cartela_number}</span>
-            <span>\${isTaken ? 'TAKEN' : '10 B'}</span>
-          </div>
-          <div class="ticket-mini-matrix">\${miniMatrixHtml}</div>
-        \`;
-
-        if (!isTaken) {
-          card.onclick = () => toggleCartelaSelection(c.id);
-        }
-        grid.appendChild(card);
-      });
-
+      activeRoomNumber = roomNumber;
       switchView('cartela-picker');
+
+      await sync100CartelaState();
+      if (pickerSyncInterval) clearInterval(pickerSyncInterval);
+      pickerSyncInterval = setInterval(sync100CartelaState, 2000); // 2s Realtime sync
     }
 
-    function toggleCartelaSelection(cartelaId) {
-      const idx = selectedCartelaIds.indexOf(cartelaId);
-      const el = document.getElementById('cartela-card-' + cartelaId);
+    async function sync100CartelaState() {
+      if (!activeRoomId) return;
+      try {
+        const res = await fetch(\`/api/rooms/\${activeRoomId}/cartelas\`, { headers: API_HEADERS });
+        const data = await res.json();
+        if (!data.success) return;
 
-      if (idx > -1) {
-        selectedCartelaIds.splice(idx, 1);
-        el.classList.remove('selected');
-      } else {
-        if (selectedCartelaIds.length >= 2) {
-          alert('Maximum 2 cartelas allowed per game.');
+        // Sync header stats
+        document.getElementById('picker-bal').innerText = data.balance;
+        document.getElementById('header-wallet-bal').innerText = data.balance + ' BIRR';
+        document.getElementById('picker-cost').innerText = (data.selectedCount * data.price).toFixed(2);
+        document.getElementById('picker-pot').innerText = (data.cartelas.filter(c => c.status !== 'available').length * data.price).toFixed(2);
+        document.getElementById('picker-countdown').innerText = data.startsInSeconds + 's';
+
+        // Auto transition if game started
+        if (data.roomStatus === 'PLAYING') {
+          if (pickerSyncInterval) clearInterval(pickerSyncInterval);
+          proceedToGameSession();
           return;
         }
-        selectedCartelaIds.push(cartelaId);
-        el.classList.add('selected');
+
+        mySelectedCartelas = data.selectedCartelas || [];
+        updateSummaryFooter(data.selectedCount, data.price);
+
+        // Render 100 Badges
+        render100Badges(data.cartelas);
+
+        // Render Previews
+        renderSelectedPreviews();
+      } catch (e) {
+        console.error('Picker sync failed', e);
       }
-      updatePurchaseSummary();
     }
 
-    function updatePurchaseSummary() {
-      document.getElementById('summary-cartela-count').innerText = selectedCartelaIds.length + ' / 2';
-      document.getElementById('summary-total-cost').innerText = (selectedCartelaIds.length * 10).toFixed(2) + ' BIRR';
+    function render100Badges(cartelas) {
+      const grid = document.getElementById('cartelas-badge-grid');
+      grid.innerHTML = '';
+
+      cartelas.forEach(c => {
+        const badge = document.createElement('div');
+        badge.className = \`badge-cartela \${c.status}\`;
+        badge.id = \`cbadge-\${c.number}\`;
+
+        let lbl = 'OPEN';
+        if (c.status === 'mine') lbl = 'MINE';
+        if (c.status === 'taken') lbl = 'TAKEN';
+
+        badge.innerHTML = \`
+          <div class="c-num">#\${c.number}</div>
+          <div class="c-lbl">\${lbl}</div>
+        \`;
+
+        badge.onclick = () => onCartelaBadgeTap(c.number, c.status);
+        grid.appendChild(badge);
+      });
     }
 
-    async function confirmCartelaPurchase() {
-      if (selectedCartelaIds.length === 0) return alert('Select at least 1 cartela');
+    async function onCartelaBadgeTap(cartelaNum, currentStatus) {
+      if (currentStatus === 'taken') {
+        showToast('🔴 Cartela already taken');
+        return;
+      }
+
+      const badge = document.getElementById(\`cbadge-\${cartelaNum}\`);
+      if (badge) badge.classList.add('loading');
+
       try {
-        const res = await fetch('/api/cartela/purchase', {
+        const res = await fetch(\`/api/rooms/\${activeRoomId}/cartelas/\${cartelaNum}/toggle\`, {
           method: 'POST',
-          headers: API_HEADERS,
-          body: JSON.stringify({ roomId: activeRoomId, cartelaIds: selectedCartelaIds })
+          headers: API_HEADERS
         });
         const data = await res.json();
+
         if (data.success) {
-          await refreshWallet();
-          launchLiveGameSession();
+          if (data.action === 'selected') {
+            showToast(\`✓ Cartela #\${cartelaNum} Selected (-10 BIRR)\`);
+          } else {
+            showToast(\`✓ Cartela #\${cartelaNum} Released (+10 BIRR)\`);
+          }
+          await sync100CartelaState();
         } else {
-          alert('Purchase failed: ' + data.message);
+          if (data.error === 'MAX_CARTELAS_REACHED') {
+            showToast('⚠️ Maximum 2 Cartelas Allowed');
+          } else if (data.error === 'INSUFFICIENT_BALANCE') {
+            showToast('💰 Insufficient Balance (Need 10 BIRR)');
+          } else if (data.error === 'CARTELA_TAKEN') {
+            showToast('🔴 Cartela was just taken');
+            await sync100CartelaState();
+          } else {
+            showToast('Error: ' + data.error);
+          }
         }
       } catch (e) {
-        alert('Network error during purchase.');
+        showToast('Network error');
+      } finally {
+        if (badge) badge.classList.remove('loading');
       }
     }
 
-    function launchLiveGameSession() {
-      switchView('live-game');
-      renderLiveCartelas();
-      if (gamePollTimer) clearInterval(gamePollTimer);
-      gamePollTimer = setInterval(pollLiveGameState, 1800);
-      pollLiveGameState();
-    }
+    async function renderSelectedPreviews() {
+      const container = document.getElementById('cartela-previews-container');
+      const countLabel = document.getElementById('preview-count-label');
+      countLabel.innerText = \`\${mySelectedCartelas.length} Cartela(s) Selected\`;
 
-    function renderLiveCartelas() {
-      const container = document.getElementById('live-cartelas-container');
+      if (mySelectedCartelas.length === 0) {
+        container.innerHTML = \`
+          <div style="text-align: center; padding: 18px; color: var(--text-muted); font-size: 12px; background: rgba(0,0,0,0.25); border-radius: 12px;">
+            Select any available cartela above to preview its 5x5 numbers.
+          </div>\`;
+        return;
+      }
+
       container.innerHTML = '';
 
-      selectedCartelaIds.forEach(cId => {
-        const item = cartelasCatalog.find(c => c.id === cId);
-        if (!item) return;
-        const matrix = typeof item.matrix === 'string' ? JSON.parse(item.matrix) : item.matrix;
+      for (const cNum of mySelectedCartelas) {
+        // Fetch matrix if not cached
+        if (!cartelaMatrixCache[cNum]) {
+          try {
+            const res = await fetch(\`/api/cartelas/\${cNum}/matrix\`, { headers: API_HEADERS });
+            const d = await res.json();
+            if (d.success) cartelaMatrixCache[cNum] = d.matrix;
+          } catch (e) {}
+        }
+
+        const matrix = cartelaMatrixCache[cNum];
+        if (!matrix) continue;
 
         const board = document.createElement('div');
-        board.className = 'cartela-board';
-        board.id = 'live-board-' + cId;
+        board.className = 'cartela-preview-board';
 
         let cellsHtml = '';
         ['B', 'I', 'N', 'G', 'O'].forEach(l => {
-          cellsHtml += \`<div class="col-letter">\${l}</div>\`;
+          cellsHtml += \`<div class="col-lbl">\${l}</div>\`;
         });
 
         for (let r = 0; r < 5; r++) {
           for (let c = 0; c < 5; c++) {
             const val = matrix[r][c];
             if (val === 0) {
-              cellsHtml += \`<div class="cell-val free-spot" data-cell="0">FREE</div>\`;
+              cellsHtml += \`<div class="cell-val free">FREE</div>\`;
             } else {
-              cellsHtml += \`<div class="cell-val" data-cell="\${val}">\${val}</div>\`;
+              cellsHtml += \`<div class="cell-val">\${val}</div>\`;
             }
           }
         }
 
         board.innerHTML = \`
-          <div class="board-header">Cartela #\${item.cartela_number}</div>
+          <div class="preview-header">
+            <span>Ticket #\${cNum}</span>
+            <span style="color:var(--text-muted); font-size:10px; cursor:pointer;" onclick="onCartelaBadgeTap(\${cNum}, 'mine')">Tap to Remove ✖</span>
+          </div>
           <div class="matrix-5x5">\${cellsHtml}</div>
         \`;
         container.appendChild(board);
+      }
+    }
+
+    function updateSummaryFooter(count, price) {
+      document.getElementById('summary-badge-count').innerText = \`\${count} / 2\`;
+      document.getElementById('summary-total-cost').innerText = \`Total: \${(count * price).toFixed(2)} BIRR\`;
+      document.getElementById('btn-continue-game').disabled = count === 0;
+    }
+
+    async function leaveCurrentRoom() {
+      if (!confirm('Leave room and refund all selected cartelas?')) return;
+      try {
+        const res = await fetch(\`/api/rooms/\${activeRoomId}/leave\`, {
+          method: 'POST',
+          headers: API_HEADERS
+        });
+        const d = await res.json();
+        if (d.success) {
+          showToast(\`Refunded \${d.refundedAmount} BIRR\`);
+          switchView('home');
+        }
+      } catch (e) {
+        showToast('Error leaving room');
+      }
+    }
+
+    function proceedToGameSession() {
+      if (pickerSyncInterval) clearInterval(pickerSyncInterval);
+      switchView('live-game');
+      document.getElementById('live-room-num').innerText = '#' + activeRoomNumber;
+      renderLiveBoardsDeck();
+
+      if (gamePollInterval) clearInterval(gamePollInterval);
+      gamePollInterval = setInterval(pollLiveGameState, 1800);
+      pollLiveGameState();
+    }
+
+    function renderLiveBoardsDeck() {
+      const deck = document.getElementById('live-boards-deck');
+      deck.innerHTML = '';
+
+      mySelectedCartelas.forEach(cNum => {
+        const matrix = cartelaMatrixCache[cNum];
+        if (!matrix) return;
+
+        const board = document.createElement('div');
+        board.className = 'cartela-preview-board';
+        board.id = \`live-deck-\${cNum}\`;
+
+        let cells = '';
+        ['B', 'I', 'N', 'G', 'O'].forEach(l => {
+          cells += \`<div class="col-lbl">\${l}</div>\`;
+        });
+
+        for (let r = 0; r < 5; r++) {
+          for (let c = 0; c < 5; c++) {
+            const val = matrix[r][c];
+            if (val === 0) {
+              cells += \`<div class="cell-val free" data-cell="0">FREE</div>\`;
+            } else {
+              cells += \`<div class="cell-val" data-cell="\${val}">\${val}</div>\`;
+            }
+          }
+        }
+
+        board.innerHTML = \`
+          <div class="preview-header">Cartela #\${cNum}</div>
+          <div class="matrix-5x5">\${cells}</div>
+        \`;
+        deck.appendChild(board);
       });
     }
 
     async function pollLiveGameState() {
       if (!activeRoomId) return;
       try {
-        const res = await fetch('/api/game/state?roomId=' + activeRoomId, { headers: API_HEADERS });
-        const data = await res.json();
-        if (!data.success) return;
+        const res = await fetch(\`/api/game/state?roomId=\${activeRoomId}\`, { headers: API_HEADERS });
+        const d = await res.json();
+        if (!d.success) return;
 
-        const gs = data.gameState;
-        document.getElementById('game-pot-val').innerText = gs.prizePool || '0';
-        document.getElementById('game-call-index').innerText = gs.calledNumbers ? gs.calledNumbers.length : '0';
-        document.getElementById('game-next-timer').innerText = gs.status === 'PLAYING' 
-          ? 'Next Call: ' + gs.nextCallInSeconds + 's' 
-          : 'Status: ' + gs.status;
+        const gs = d.gameState;
+        document.getElementById('live-pot').innerText = gs.prizePool || '0.00';
+        document.getElementById('live-call-idx').innerText = gs.calledNumbers?.length || '0';
+        document.getElementById('live-timer-text').innerText = gs.status === 'PLAYING'
+          ? \`Next call: \${gs.nextCallInSeconds}s\`
+          : \`Status: \${gs.status}\`;
 
-        // Current Ball
         if (gs.currentNumber) {
-          const num = gs.currentNumber;
-          let letter = 'B';
-          if (num > 15 && num <= 30) letter = 'I';
-          if (num > 30 && num <= 45) letter = 'N';
-          if (num > 45 && num <= 60) letter = 'G';
-          if (num > 60) letter = 'O';
+          const n = gs.currentNumber;
+          let ltr = 'B';
+          if (n > 15 && n <= 30) ltr = 'I';
+          if (n > 30 && n <= 45) ltr = 'N';
+          if (n > 45 && n <= 60) ltr = 'G';
+          if (n > 60) ltr = 'O';
 
-          document.getElementById('current-ball-letter').innerText = letter;
-          document.getElementById('current-ball-number').innerText = num;
-
-          // Audio Speech Synthesizer
-          if (document.getElementById('setting-voice').checked && lastSpokenNumber !== num) {
-            lastSpokenNumber = num;
-            if ('speechSynthesis' in window) {
-              const utter = new SpeechSynthesisUtterance(letter + ' ' + num);
-              utter.rate = 1.1;
-              window.speechSynthesis.speak(utter);
-            }
-          }
+          document.getElementById('live-ball-ltr').innerText = ltr;
+          document.getElementById('live-ball-num').innerText = n;
         }
 
-        // Recent Numbers Ribbon
-        const ribbon = document.getElementById('recent-calls-ribbon');
-        ribbon.innerHTML = '';
-        const called = gs.calledNumbers || [];
-        called.slice(-7).reverse().forEach(n => {
-          const p = document.createElement('div');
-          p.className = 'recent-pill';
-          p.innerText = n;
-          ribbon.appendChild(p);
-        });
-
-        // Mark Matching Cells on all rendered boards
-        const calledSet = new Set(called);
-        document.querySelectorAll('.cell-val').forEach(cell => {
-          const v = parseInt(cell.getAttribute('data-cell'), 10);
+        // Automatic Marking
+        const calledSet = new Set(gs.calledNumbers || []);
+        document.querySelectorAll('.cell-val').forEach(c => {
+          const v = parseInt(c.getAttribute('data-cell'), 10);
           if (v !== 0 && calledSet.has(v)) {
-            cell.classList.add('marked');
+            c.classList.add('marked');
           }
         });
 
-        // Winner Detected
-        if (gs.status === 'FINISHED' && gs.winners && gs.winners.length > 0) {
-          clearInterval(gamePollTimer);
-          const w = gs.winners[0];
-          document.getElementById('win-modal-pot').innerText = gs.prizePool + ' BIRR';
-          document.getElementById('win-modal-winner-name').innerText = 'Winner: ' + w.display_name;
-          document.getElementById('win-modal-cartela-num').innerText = 'Cartela: #' + w.cartela_number;
-          document.getElementById('winner-modal').classList.add('active');
+        if (gs.status === 'FINISHED' && gs.winners?.length > 0) {
+          clearInterval(gamePollInterval);
+          alert(\`🎉 GAME OVER! Winner: \${gs.winners.map(w => w.display_name + ' (#' + w.cartela_number + ')').join(', ')}\`);
           await refreshWallet();
         }
       } catch (e) {
-        console.error('Poll error', e);
+        console.error('Live game poll failed', e);
       }
     }
 
     async function claimBingoVictory() {
-      if (!activeRoomId || selectedCartelaIds.length === 0) return;
+      if (!activeRoomId || mySelectedCartelas.length === 0) return;
       try {
         const res = await fetch('/api/game/bingo', {
           method: 'POST',
           headers: API_HEADERS,
-          body: JSON.stringify({ roomId: activeRoomId, cartelaId: selectedCartelaIds[0] })
+          body: JSON.stringify({ roomId: activeRoomId, cartelaNumber: mySelectedCartelas[0] })
         });
-        const data = await res.json();
-        if (data.success) {
-          document.getElementById('win-modal-pot').innerText = data.prizeAmount + ' BIRR';
-          document.getElementById('win-modal-winner-name').innerText = 'You Won!';
-          document.getElementById('win-modal-cartela-num').innerText = 'Cartela: #' + data.cartelaNumber;
-          document.getElementById('winner-modal').classList.add('active');
+        const d = await res.json();
+        if (d.success) {
+          alert(\`🎉 BINGO VERIFIED! You won \${d.prizeAmount} BIRR on Cartela #\${d.cartelaNumber}!\`);
           await refreshWallet();
         } else {
-          alert('Bingo claim rejected: ' + data.message);
+          alert('Bingo claim rejected: ' + d.message);
         }
       } catch (e) {
-        alert('Verification error.');
+        alert('Verification request failed');
       }
-    }
-
-    function closeWinnerModal() {
-      document.getElementById('winner-modal').classList.remove('active');
-      switchView('home');
-    }
-
-    async function submitDepositOrder() {
-      const amount = document.getElementById('inp-dep-amt').value;
-      const paymentMethod = document.getElementById('inp-dep-method').value;
-      const transactionId = document.getElementById('inp-dep-txid').value;
-
-      const res = await fetch('/api/deposit', {
-        method: 'POST',
-        headers: API_HEADERS,
-        body: JSON.stringify({ amount, paymentMethod, transactionId })
-      });
-      const data = await res.json();
-      if (data.success) {
-        alert('Deposit order queued for verification.');
-        document.getElementById('inp-dep-amt').value = '';
-        document.getElementById('inp-dep-txid').value = '';
-      } else {
-        alert('Error: ' + data.message);
-      }
-    }
-
-    async function submitWithdrawOrder() {
-      const amount = document.getElementById('inp-wd-amt').value;
-      const paymentMethod = document.getElementById('inp-wd-method').value;
-      const accountNumber = document.getElementById('inp-wd-acc').value;
-      const accountHolder = document.getElementById('inp-wd-name').value;
-
-      const res = await fetch('/api/withdraw', {
-        method: 'POST',
-        headers: API_HEADERS,
-        body: JSON.stringify({ amount, paymentMethod, accountNumber, accountHolder })
-      });
-      const data = await res.json();
-      if (data.success) {
-        alert('Withdrawal request placed successfully.');
-        await refreshWallet();
-      } else {
-        alert('Error: ' + data.message);
-      }
-    }
-
-    async function loadHistory() {
-      const list = document.getElementById('history-audit-list');
-      try {
-        const res = await fetch('/api/history', { headers: API_HEADERS });
-        const data = await res.json();
-        if (!data.transactions || data.transactions.length === 0) {
-          list.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:16px;">No transactions recorded.</div>';
-          return;
-        }
-        list.innerHTML = data.transactions.map(t => \`
-          <div style="background:var(--bg-card); border:1px solid var(--bg-card-border); border-radius:12px; padding:10px 14px; margin-bottom:8px;">
-            <div style="display:flex; justify-content:space-between; font-weight:800; font-size:13px;">
-              <span>\${t.type}</span>
-              <span style="color:var(--bright-gold);">\${t.amount} BIRR</span>
-            </div>
-            <div style="font-size:11px; color:var(--text-secondary); margin-top:2px;">Bal: \${t.balance_after} BIRR | \${new Date(t.created_at).toLocaleDateString()}</div>
-          </div>
-        \`).join('');
-      } catch (e) {
-        list.innerHTML = 'Error loading history.';
-      }
-    }
-
-    function copyInviteLink() {
-      const copyText = document.getElementById("invite-link-input");
-      copyText.select();
-      copyText.setSelectionRange(0, 99999);
-      navigator.clipboard.writeText(copyText.value);
-      alert("Invite link copied to clipboard!");
     }
 
     window.addEventListener('load', async () => {
@@ -1818,7 +1771,7 @@ function getMiniAppHTML() {
 }
 
 // ============================================================================
-// 12. RUNTIME SERVERLESS / HTTP HANDLER
+// 11. RUNTIME SERVERLESS / HTTP HANDLER
 // ============================================================================
 async function appHandler(req, res) {
   try {
