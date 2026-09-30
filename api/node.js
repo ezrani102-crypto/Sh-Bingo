@@ -38,7 +38,10 @@
 // ============================================================
 
 const CONFIG = {
-  BOT_TOKEN: process.env.BOT_TOKEN || '',
+ BOT_TOKEN:
+  process.env.BOT_TOKEN ||
+  process.env.TELEGRAM_BOT_TOKEN ||
+  '',
 
   ADMIN_TELEGRAM_ID:
     process.env.ADMIN_TELEGRAM_ID || '7336477309',
