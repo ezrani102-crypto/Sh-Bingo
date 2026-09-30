@@ -1,8 +1,8 @@
 /**
  * ============================================================================
  * SHISHO BINGO — COMPLETE SINGLE-FILE ARCHITECTURE
- * Engine: Node.js Vanilla HTTP + PostgreSQL (pg) + Telegram Mini App
- * Deployment Target: Vercel Serverless Function & Local Node.js
+ * Engine: Node.js HTTP + PostgreSQL (pg) + Telegram Mini App + Serverless Tick
+ * Redesign: Mobile-First Glassmorphism (Screenshot 2 Reference)
  * ============================================================================
  */
 
@@ -33,14 +33,11 @@ const CONFIG = {
 };
 
 // ============================================================================
-// 2. DATABASE CLIENT & INITIALIZATION
+// 2. DATABASE POOL & INITIALIZATION
 // ============================================================================
 let pool;
 function getDbPool() {
   if (!pool) {
-    if (!CONFIG.DATABASE_URL) {
-      console.warn("WARNING: DATABASE_URL is not set.");
-    }
     pool = new Pool({
       connectionString: CONFIG.DATABASE_URL,
       ssl: CONFIG.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
@@ -198,13 +195,11 @@ async function initDatabase() {
     await seedDefaultCartelas();
     await ensureDefaultWaitingRoom();
     dbInitialized = true;
-    console.log("Database initialized successfully.");
   } catch (err) {
-    console.error("Database initialization error:", err);
+    console.error('Database initialization error:', err);
   }
 }
 
-// Generate static 50 standard cartelas if none exist
 async function seedDefaultCartelas() {
   const res = await query('SELECT COUNT(*) FROM cartelas');
   if (parseInt(res.rows[0].count, 10) >= 50) return;
@@ -231,7 +226,7 @@ async function ensureDefaultWaitingRoom() {
 }
 
 // ============================================================================
-// 3. SECURITY & TELEGRAM AUTHENTICATION
+// 3. CRYPTOGRAPHY & TELEGRAM AUTHENTICATION
 // ============================================================================
 function verifyTelegramInitData(initDataRaw) {
   if (!initDataRaw || !CONFIG.TELEGRAM_BOT_TOKEN) return null;
@@ -248,12 +243,9 @@ function verifyTelegramInitData(initDataRaw) {
     const calculatedHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
 
     if (calculatedHash !== hash) return null;
-
     const userRaw = params.get('user');
-    if (!userRaw) return null;
-    return JSON.parse(userRaw);
+    return userRaw ? JSON.parse(userRaw) : null;
   } catch (err) {
-    console.error('Telegram auth verification failed:', err);
     return null;
   }
 }
@@ -289,8 +281,6 @@ async function findOrCreateUser(tgUser, referredByCode = null) {
       [tgUser.id, tgUser.username || '', tgUser.first_name || '', tgUser.last_name || '', tgUser.first_name || 'Player', refCode, referredById]
     );
     const user = newUserRes.rows[0];
-
-    // Seed authoritative 0.00 wallet
     await client.query('INSERT INTO wallets (user_id, balance) VALUES ($1, 0.00)', [user.id]);
     await client.query('COMMIT');
     return user;
@@ -304,14 +294,11 @@ async function findOrCreateUser(tgUser, referredByCode = null) {
 
 async function getAuthoritativeWallet(userId) {
   const res = await query('SELECT balance FROM wallets WHERE user_id = $1', [userId]);
-  if (res.rows.length === 0) {
-    throw new Error('WALLET_NOT_FOUND');
-  }
+  if (res.rows.length === 0) throw new Error('WALLET_NOT_FOUND');
   return parseFloat(res.rows[0].balance).toFixed(2);
 }
 
 async function modifyWalletAtomic(client, { userId, amount, type, referenceId, description }) {
-  // Amount can be positive (credit) or negative (debit)
   const wRes = await client.query('SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE', [userId]);
   if (wRes.rows.length === 0) throw new Error('WALLET_NOT_FOUND');
 
@@ -319,12 +306,9 @@ async function modifyWalletAtomic(client, { userId, amount, type, referenceId, d
   const delta = parseFloat(amount);
   const newBal = parseFloat((currentBal + delta).toFixed(2));
 
-  if (newBal < 0) {
-    throw new Error('INSUFFICIENT_FUNDS');
-  }
+  if (newBal < 0) throw new Error('INSUFFICIENT_FUNDS');
 
   await client.query('UPDATE wallets SET balance = $1, updated_at = NOW() WHERE user_id = $2', [newBal, userId]);
-
   await client.query(
     `INSERT INTO wallet_transactions (user_id, type, amount, balance_before, balance_after, reference_id, description)
      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -334,7 +318,6 @@ async function modifyWalletAtomic(client, { userId, amount, type, referenceId, d
   return newBal.toFixed(2);
 }
 
-// Calculate 20% house rake and net prize pool
 function calculatePrizeDistribution(totalPot, feePercent = CONFIG.HOUSE_FEE_PERCENT) {
   const pot = parseFloat(totalPot);
   const houseFee = parseFloat(((pot * feePercent) / 100).toFixed(2));
@@ -346,9 +329,8 @@ function calculatePrizeDistribution(totalPot, feePercent = CONFIG.HOUSE_FEE_PERC
 // 5. BINGO MATH & CARTELA MATRIX GENERATION
 // ============================================================================
 function generateBingoMatrix(seed = 1) {
-  // Deterministic seedable pseudo-random generation for stable reproducible cartelas
   function pseudoRandom(s) {
-    let t = s += 0x6D2B79F5;
+    let t = (s += 0x6d2b79f5);
     t = Math.imul(t ^ (t >>> 15), t | 1);
     t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
@@ -383,7 +365,6 @@ function generateBingoMatrix(seed = 1) {
   return grid;
 }
 
-// Shuffle 1..75 using Fisher-Yates
 function generateDrawSequence() {
   const arr = [];
   for (let i = 1; i <= 75; i++) arr.push(i);
@@ -399,24 +380,17 @@ function generateDrawSequence() {
 // 6. ROOM ORCHESTRATION & PERSISTENT CARTELA LOCKING
 // ============================================================================
 async function purchaseCartelasAtomic(userId, roomId, cartelaIds) {
-  if (!Array.isArray(cartelaIds) || cartelaIds.length === 0) {
-    throw new Error('NO_CARTELAS_SELECTED');
-  }
-  if (cartelaIds.length > CONFIG.MAX_CARTELAS) {
-    throw new Error(`EXCEEDS_MAX_CARTELAS_${CONFIG.MAX_CARTELAS}`);
-  }
+  if (!Array.isArray(cartelaIds) || cartelaIds.length === 0) throw new Error('NO_CARTELAS_SELECTED');
+  if (cartelaIds.length > CONFIG.MAX_CARTELAS) throw new Error(`EXCEEDS_MAX_CARTELAS_${CONFIG.MAX_CARTELAS}`);
 
   const client = await getDbPool().connect();
   try {
     await client.query('BEGIN');
-
-    // 1. Verify Room State
     const rRes = await client.query('SELECT * FROM rooms WHERE id = $1 FOR UPDATE', [roomId]);
     if (rRes.rows.length === 0) throw new Error('ROOM_NOT_FOUND');
     const room = rRes.rows[0];
     if (room.status !== 'WAITING') throw new Error('ROOM_ALREADY_STARTED');
 
-    // 2. Check user's current purchases in this room
     const existingPurchases = await client.query(
       'SELECT cartela_id FROM room_cartelas WHERE room_id = $1 AND user_id = $2',
       [roomId, userId]
@@ -425,7 +399,6 @@ async function purchaseCartelasAtomic(userId, roomId, cartelaIds) {
       throw new Error('LIMIT_EXCEEDED');
     }
 
-    // 3. Check wallet balance
     const totalCost = (CONFIG.GAME_STAKE * cartelaIds.length).toFixed(2);
     const wRes = await client.query('SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE', [userId]);
     if (wRes.rows.length === 0) throw new Error('WALLET_NOT_FOUND');
@@ -433,28 +406,24 @@ async function purchaseCartelasAtomic(userId, roomId, cartelaIds) {
       throw new Error('INSUFFICIENT_FUNDS');
     }
 
-    // 4. Reserve Cartelas with UNIQUE protection
     for (const cId of cartelaIds) {
       try {
-        await client.query(
-          'INSERT INTO room_cartelas (room_id, cartela_id, user_id) VALUES ($1, $2, $3)',
-          [roomId, cId, userId]
-        );
+        await client.query('INSERT INTO room_cartelas (room_id, cartela_id, user_id) VALUES ($1, $2, $3)', [
+          roomId,
+          cId,
+          userId,
+        ]);
       } catch (err) {
-        if (err.code === '23505') {
-          throw new Error(`CARTELA_${cId}_ALREADY_TAKEN`);
-        }
+        if (err.code === '23505') throw new Error(`CARTELA_${cId}_ALREADY_TAKEN`);
         throw err;
       }
     }
 
-    // 5. Ensure room player membership
     await client.query(
       'INSERT INTO room_players (room_id, user_id) VALUES ($1, $2) ON CONFLICT (room_id, user_id) DO NOTHING',
       [roomId, userId]
     );
 
-    // 6. Debit authoritative wallet
     const newBal = await modifyWalletAtomic(client, {
       userId,
       amount: -parseFloat(totalCost),
@@ -473,12 +442,11 @@ async function purchaseCartelasAtomic(userId, roomId, cartelaIds) {
   }
 }
 
-// Transition WAITING -> STARTING -> PLAYING
 async function tryAutoStartRoom(roomId) {
   const client = await getDbPool().connect();
   try {
     await client.query('BEGIN');
-    const rRes = await client.query("SELECT * FROM rooms WHERE id = $1 FOR UPDATE", [roomId]);
+    const rRes = await client.query('SELECT * FROM rooms WHERE id = $1 FOR UPDATE', [roomId]);
     if (rRes.rows.length === 0) {
       await client.query('COMMIT');
       return;
@@ -492,17 +460,12 @@ async function tryAutoStartRoom(roomId) {
     const cCountRes = await client.query('SELECT COUNT(*) FROM room_cartelas WHERE room_id = $1', [roomId]);
     const cartelaCount = parseInt(cCountRes.rows[0].count, 10);
 
-    // If room is full or manually ready (threshold: at least 2 cartelas for game mechanics)
     if (cartelaCount >= 2) {
       const totalPot = (cartelaCount * CONFIG.GAME_STAKE).toFixed(2);
       const { houseFee, prizePool } = calculatePrizeDistribution(totalPot);
       const { sequence, hash } = generateDrawSequence();
 
-      await client.query(
-        "UPDATE rooms SET status = 'PLAYING', updated_at = NOW() WHERE id = $1",
-        [roomId]
-      );
-
+      await client.query("UPDATE rooms SET status = 'PLAYING', updated_at = NOW() WHERE id = $1", [roomId]);
       const nextCallAt = new Date(Date.now() + CONFIG.CALL_INTERVAL_SECONDS * 1000);
 
       await client.query(
@@ -512,20 +475,19 @@ async function tryAutoStartRoom(roomId) {
         [roomId, JSON.stringify(sequence), hash, nextCallAt, totalPot, houseFee, prizePool]
       );
 
-      // Create next waiting room if needed
       await ensureDefaultWaitingRoom();
     }
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('Failed to auto-start room:', err);
+    console.error('Auto start room error:', err);
   } finally {
     client.release();
   }
 }
 
 // ============================================================================
-// 7. SERVERLESS GAME ENGINE & PROBABILISTIC TICK DRIVER
+// 7. SERVERLESS TICK ENGINE & BINGO VALIDATION
 // ============================================================================
 async function tickGameEngine(roomId) {
   const client = await getDbPool().connect();
@@ -545,7 +507,6 @@ async function tickGameEngine(roomId) {
     const now = new Date();
     const nextCall = new Date(game.next_call_at);
 
-    // Only progress if target timestamp reached
     if (now >= nextCall) {
       const drawOrder = typeof game.draw_order === 'string' ? JSON.parse(game.draw_order) : game.draw_order;
       let called = typeof game.called_numbers === 'string' ? JSON.parse(game.called_numbers) : game.called_numbers;
@@ -557,9 +518,7 @@ async function tickGameEngine(roomId) {
         const newNextCallAt = new Date(Date.now() + CONFIG.CALL_INTERVAL_SECONDS * 1000);
 
         await client.query(
-          `UPDATE games 
-           SET called_numbers = $1, current_index = $2, next_call_at = $3
-           WHERE id = $4`,
+          `UPDATE games SET called_numbers = $1, current_index = $2, next_call_at = $3 WHERE id = $4`,
           [JSON.stringify(called), newIndex, newNextCallAt, game.id]
         );
 
@@ -568,110 +527,76 @@ async function tickGameEngine(roomId) {
           [game.id, JSON.stringify({ number: nextNum, index: newIndex })]
         );
       } else {
-        // Draw pool exhausted without winner
         await client.query("UPDATE games SET status = 'FINISHED', finished_at = NOW() WHERE id = $1", [game.id]);
         await client.query("UPDATE rooms SET status = 'FINISHED', updated_at = NOW() WHERE id = $2", [roomId]);
       }
     }
-
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('Game tick error:', err);
+    console.error('Tick error:', err);
   } finally {
     client.release();
   }
 }
 
-// ============================================================================
-// 8. BINGO VALIDATION ENGINE (LINE & CORNERS)
-// ============================================================================
 function verifyBingoPattern(matrix, calledSet) {
-  // matrix: 5x5 array
-  // returns { won: boolean, pattern: string, winningCells: [[r, c], ...] }
-
-  // 1. Check Horizontal Rows
   for (let r = 0; r < 5; r++) {
     let rowMatch = true;
-    const cells = [];
     for (let c = 0; c < 5; c++) {
       const val = matrix[r][c];
-      if (val === 0 || calledSet.has(val)) {
-        cells.push([r, c]);
-      } else {
+      if (val !== 0 && !calledSet.has(val)) {
         rowMatch = false;
         break;
       }
     }
-    if (rowMatch) return { won: true, pattern: `ROW_${r + 1}`, winningCells: cells };
+    if (rowMatch) return { won: true, pattern: `ROW_${r + 1}` };
   }
 
-  // 2. Check Vertical Columns
   for (let c = 0; c < 5; c++) {
     let colMatch = true;
-    const cells = [];
     for (let r = 0; r < 5; r++) {
       const val = matrix[r][c];
-      if (val === 0 || calledSet.has(val)) {
-        cells.push([r, c]);
-      } else {
+      if (val !== 0 && !calledSet.has(val)) {
         colMatch = false;
         break;
       }
     }
-    if (colMatch) return { won: true, pattern: `COLUMN_${c + 1}`, winningCells: cells };
+    if (colMatch) return { won: true, pattern: `COLUMN_${c + 1}` };
   }
 
-  // 3. Diagonal Top-Left to Bottom-Right
-  let diag1Match = true;
-  const diag1Cells = [];
+  let diag1 = true;
   for (let i = 0; i < 5; i++) {
     const val = matrix[i][i];
-    if (val === 0 || calledSet.has(val)) {
-      diag1Cells.push([i, i]);
-    } else {
-      diag1Match = false;
+    if (val !== 0 && !calledSet.has(val)) {
+      diag1 = false;
       break;
     }
   }
-  if (diag1Match) return { won: true, pattern: 'DIAGONAL_MAIN', winningCells: diag1Cells };
+  if (diag1) return { won: true, pattern: 'DIAGONAL_1' };
 
-  // 4. Diagonal Top-Right to Bottom-Left
-  let diag2Match = true;
-  const diag2Cells = [];
+  let diag2 = true;
   for (let i = 0; i < 5; i++) {
     const val = matrix[i][4 - i];
-    if (val === 0 || calledSet.has(val)) {
-      diag2Cells.push([i, 4 - i]);
-    } else {
-      diag2Match = false;
+    if (val !== 0 && !calledSet.has(val)) {
+      diag2 = false;
       break;
     }
   }
-  if (diag2Match) return { won: true, pattern: 'DIAGONAL_ANTI', winningCells: diag2Cells };
+  if (diag2) return { won: true, pattern: 'DIAGONAL_2' };
 
-  // 5. Four Corners Pattern
-  const corners = [
-    [0, 0],
-    [0, 4],
-    [4, 0],
-    [4, 4],
-  ];
-  const cornersMatch = corners.every(([r, c]) => {
-    const val = matrix[r][c];
-    return val === 0 || calledSet.has(val);
-  });
-  if (cornersMatch) return { won: true, pattern: 'FOUR_CORNERS', winningCells: corners };
+  const corners = [matrix[0][0], matrix[0][4], matrix[4][0], matrix[4][4]];
+  if (corners.every((v) => v === 0 || calledSet.has(v))) {
+    return { won: true, pattern: 'FOUR_CORNERS' };
+  }
 
-  return { won: false, pattern: null, winningCells: [] };
+  return { won: false, pattern: null };
 }
 
 async function claimBingoAtomic(userId, roomId, cartelaId) {
   const client = await getDbPool().connect();
   try {
     await client.query('BEGIN');
-
-    // 1. Fetch game and check status
     const gRes = await client.query(
       "SELECT * FROM games WHERE room_id = $1 AND status = 'PLAYING' FOR UPDATE",
       [roomId]
@@ -679,74 +604,44 @@ async function claimBingoAtomic(userId, roomId, cartelaId) {
     if (gRes.rows.length === 0) throw new Error('GAME_NOT_ACTIVE');
     const game = gRes.rows[0];
 
-    // 2. Verify user owns cartela in this room
     const rcRes = await client.query(
       'SELECT * FROM room_cartelas WHERE room_id = $1 AND cartela_id = $2 AND user_id = $3',
       [roomId, cartelaId, userId]
     );
     if (rcRes.rows.length === 0) throw new Error('CARTELA_NOT_OWNED');
 
-    // 3. Fetch cartela matrix
     const cRes = await client.query('SELECT * FROM cartelas WHERE id = $1', [cartelaId]);
     if (cRes.rows.length === 0) throw new Error('CARTELA_NOT_FOUND');
     const cartela = cRes.rows[0];
     const matrix = typeof cartela.matrix === 'string' ? JSON.parse(cartela.matrix) : cartela.matrix;
 
-    // 4. Validate Bingo pattern against called numbers
-    const calledNumbers = typeof game.called_numbers === 'string' ? JSON.parse(game.called_numbers) : game.called_numbers;
-    const calledSet = new Set(calledNumbers);
-    const check = verifyBingoPattern(matrix, calledSet);
+    const called = typeof game.called_numbers === 'string' ? JSON.parse(game.called_numbers) : game.called_numbers;
+    const check = verifyBingoPattern(matrix, new Set(called));
+    if (!check.won) throw new Error('INVALID_BINGO_CLAIM');
 
-    if (!check.won) {
-      throw new Error('INVALID_BINGO_CLAIM');
-    }
-
-    // 5. Atomic winner finalization
     const prizeAmount = parseFloat(game.prize_pool).toFixed(2);
-
-    // Register Winner
     await client.query(
-      `INSERT INTO game_winners (game_id, user_id, cartela_id, prize_amount, pattern_matched)
-       VALUES ($1, $2, $3, $4, $5)`,
+      `INSERT INTO game_winners (game_id, user_id, cartela_id, prize_amount, pattern_matched) VALUES ($1, $2, $3, $4, $5)`,
       [game.id, userId, cartelaId, prizeAmount, check.pattern]
     );
 
-    // Credit Winner Authoritative Wallet
-    const updatedBalance = await modifyWalletAtomic(client, {
+    const updatedBal = await modifyWalletAtomic(client, {
       userId,
       amount: parseFloat(prizeAmount),
       type: 'GAME_PRIZE',
       referenceId: `GAME_${game.id}_WIN_${cartelaId}`,
-      description: `Bingo Prize for Room #${roomId}, Cartela #${cartela.cartela_number}`,
+      description: `Bingo Prize for Room #${roomId}`,
     });
 
-    // Mark Game & Room as FINISHED
-    await client.query(
-      "UPDATE games SET status = 'FINISHED', finished_at = NOW() WHERE id = $1",
-      [game.id]
-    );
-    await client.query(
-      "UPDATE rooms SET status = 'FINISHED', updated_at = NOW() WHERE id = $1",
-      [roomId]
-    );
-
+    await client.query("UPDATE games SET status = 'FINISHED', finished_at = NOW() WHERE id = $1", [game.id]);
+    await client.query("UPDATE rooms SET status = 'FINISHED', updated_at = NOW() WHERE id = $1", [roomId]);
     await client.query('COMMIT');
-
-    // Dispatch Telegram Bot alert
-    const uRes = await query('SELECT telegram_id, display_name FROM users WHERE id = $1', [userId]);
-    if (uRes.rows.length > 0) {
-      const winner = uRes.rows[0];
-      sendTelegramMessage(
-        winner.telegram_id,
-        `🎉 *BINGO WINNER!*\n\nCongratulations, ${winner.display_name}!\nYou won Cartela *#${cartela.cartela_number}* in Room *#${roomId}*!\n\nPrize Credited: *${prizeAmount} BIRR*\nNew Balance: *${updatedBalance} BIRR*`
-      );
-    }
 
     return {
       success: true,
-      pattern: check.pattern,
       prizeAmount,
-      updatedBalance,
+      updatedBalance: updatedBal,
+      pattern: check.pattern,
       cartelaNumber: cartela.cartela_number,
     };
   } catch (e) {
@@ -758,85 +653,23 @@ async function claimBingoAtomic(userId, roomId, cartelaId) {
 }
 
 // ============================================================================
-// 9. FINANCIAL ACCOUNTING (DEPOSITS & WITHDRAWALS)
+// 8. DEPOSIT & WITHDRAWAL REPOSITORY
 // ============================================================================
 async function createDepositAtomic(userId, amount, paymentMethod, transactionId) {
   const amt = parseFloat(amount);
   if (isNaN(amt) || amt <= 0) throw new Error('INVALID_AMOUNT');
-  if (!transactionId || transactionId.trim().length === 0) throw new Error('TRANSACTION_ID_REQUIRED');
+  if (!transactionId || !transactionId.trim()) throw new Error('TRANSACTION_ID_REQUIRED');
 
   const res = await query(
-    `INSERT INTO deposits (user_id, amount, payment_method, transaction_id, status)
-     VALUES ($1, $2, $3, $4, 'PENDING') RETURNING *`,
+    `INSERT INTO deposits (user_id, amount, payment_method, transaction_id, status) VALUES ($1, $2, $3, $4, 'PENDING') RETURNING *`,
     [userId, amt.toFixed(2), paymentMethod, transactionId.trim()]
   );
-  const dep = res.rows[0];
-
-  // Notify Super Admin on Telegram
-  const uRes = await query('SELECT telegram_id, telegram_username, display_name FROM users WHERE id = $1', [userId]);
-  const user = uRes.rows[0];
-  if (CONFIG.ADMIN_TELEGRAM_ID) {
-    sendTelegramMessage(
-      CONFIG.ADMIN_TELEGRAM_ID,
-      `🔔 *NEW DEPOSIT REQUEST*\n\n` +
-      `User: ${user.display_name} (@${user.telegram_username || 'none'})\n` +
-      `Telegram ID: \`${user.telegram_id}\`\n` +
-      `Amount: *${amt.toFixed(2)} BIRR*\n` +
-      `Method: *${paymentMethod}*\n` +
-      `Tx ID: \`${transactionId}\`\n\n` +
-      `Approve via API or Admin Panel.`
-    );
-  }
-  return dep;
-}
-
-async function approveDepositAtomic(depositId, adminNotes = 'Approved by Admin') {
-  const client = await getDbPool().connect();
-  try {
-    await client.query('BEGIN');
-    const dRes = await client.query('SELECT * FROM deposits WHERE id = $1 FOR UPDATE', [depositId]);
-    if (dRes.rows.length === 0) throw new Error('DEPOSIT_NOT_FOUND');
-    const deposit = dRes.rows[0];
-    if (deposit.status !== 'PENDING') throw new Error(`DEPOSIT_ALREADY_${deposit.status}`);
-
-    await client.query(
-      "UPDATE deposits SET status = 'APPROVED', admin_notes = $1, updated_at = NOW() WHERE id = $2",
-      [adminNotes, depositId]
-    );
-
-    const newBal = await modifyWalletAtomic(client, {
-      userId: deposit.user_id,
-      amount: parseFloat(deposit.amount),
-      type: 'DEPOSIT',
-      referenceId: `DEP_${deposit.id}`,
-      description: `Deposit via ${deposit.payment_method} (Tx:${deposit.transaction_id})`,
-    });
-
-    await client.query('COMMIT');
-
-    // Notify User
-    const uRes = await query('SELECT telegram_id FROM users WHERE id = $1', [deposit.user_id]);
-    if (uRes.rows.length > 0) {
-      sendTelegramMessage(
-        uRes.rows[0].telegram_id,
-        `✅ *Deposit Approved!*\n\nYour deposit of *${deposit.amount} BIRR* has been credited.\nNew Available Balance: *${newBal} BIRR*`
-      );
-    }
-
-    return { success: true, newBalance: newBal };
-  } catch (e) {
-    await client.query('ROLLBACK');
-    throw e;
-  } finally {
-    client.release();
-  }
+  return res.rows[0];
 }
 
 async function createWithdrawalAtomic(userId, amount, paymentMethod, accountNumber, accountHolder) {
   const amt = parseFloat(amount);
-  if (isNaN(amt) || amt < CONFIG.MIN_WITHDRAWAL) {
-    throw new Error(`MINIMUM_WITHDRAWAL_${CONFIG.MIN_WITHDRAWAL}_BIRR`);
-  }
+  if (isNaN(amt) || amt < CONFIG.MIN_WITHDRAWAL) throw new Error(`MINIMUM_WITHDRAWAL_${CONFIG.MIN_WITHDRAWAL}_BIRR`);
 
   const client = await getDbPool().connect();
   try {
@@ -849,38 +682,21 @@ async function createWithdrawalAtomic(userId, amount, paymentMethod, accountNumb
       throw new Error(`MUST_RETAIN_${CONFIG.MIN_REMAINING_BALANCE}_BIRR_FOR_GAMES`);
     }
 
-    // Debit authoritative balance immediately into pending hold
     const newBal = await modifyWalletAtomic(client, {
       userId,
       amount: -amt,
       type: 'WITHDRAWAL',
-      referenceId: `PENDING_WD_${Date.now()}`,
+      referenceId: `WD_${Date.now()}`,
       description: `Withdrawal request to ${paymentMethod} (${accountNumber})`,
     });
 
     const insRes = await client.query(
-      `INSERT INTO withdrawals (user_id, amount, payment_method, account_number, account_holder, status)
-       VALUES ($1, $2, $3, $4, $5, 'PENDING') RETURNING *`,
+      `INSERT INTO withdrawals (user_id, amount, payment_method, account_number, account_holder, status) VALUES ($1, $2, $3, $4, $5, 'PENDING') RETURNING *`,
       [userId, amt.toFixed(2), paymentMethod, accountNumber, accountHolder]
     );
-    const wd = insRes.rows[0];
 
     await client.query('COMMIT');
-
-    // Notify Admin
-    if (CONFIG.ADMIN_TELEGRAM_ID) {
-      sendTelegramMessage(
-        CONFIG.ADMIN_TELEGRAM_ID,
-        `💸 *NEW WITHDRAWAL REQUEST*\n\n` +
-        `User ID: \`${userId}\`\n` +
-        `Amount: *${amt.toFixed(2)} BIRR*\n` +
-        `Method: *${paymentMethod}*\n` +
-        `Account: \`${accountNumber}\` (${accountHolder})\n\n` +
-        `Action needed in Admin panel.`
-      );
-    }
-
-    return { success: true, withdrawal: wd, newBalance: newBal };
+    return { success: true, withdrawal: insRes.rows[0], newBalance: newBal };
   } catch (e) {
     await client.query('ROLLBACK');
     throw e;
@@ -890,15 +706,11 @@ async function createWithdrawalAtomic(userId, amount, paymentMethod, accountNumb
 }
 
 // ============================================================================
-// 10. TELEGRAM BOT ENGINE & WEBHOOK DISPATCHER
+// 9. TELEGRAM BOT ENGINE
 // ============================================================================
 async function sendTelegramMessage(chatId, text, replyMarkup = null) {
   if (!CONFIG.TELEGRAM_BOT_TOKEN || !chatId) return;
-  const payload = {
-    chat_id: chatId,
-    text: text,
-    parse_mode: 'Markdown',
-  };
+  const payload = { chat_id: chatId, text, parse_mode: 'Markdown' };
   if (replyMarkup) payload.reply_markup = replyMarkup;
 
   return new Promise((resolve) => {
@@ -918,10 +730,7 @@ async function sendTelegramMessage(chatId, text, replyMarkup = null) {
         res.on('end', () => resolve(body));
       }
     );
-    req.on('error', (e) => {
-      console.error('Telegram API error:', e);
-      resolve(null);
-    });
+    req.on('error', () => resolve(null));
     req.write(postData);
     req.end();
   });
@@ -934,7 +743,6 @@ async function handleTelegramWebhook(body) {
   const text = (msg.text || '').trim();
   const fromUser = msg.from;
 
-  // Track / Register User
   let startPayload = null;
   if (text.startsWith('/start ref_')) {
     startPayload = text.replace('/start ref_', '').trim();
@@ -953,117 +761,20 @@ async function handleTelegramWebhook(body) {
   };
 
   if (text.startsWith('/start')) {
-    const welcome =
-      `🎉 *Welcome to Shisho Bingo, ${user.display_name}!* 🇪🇹\n\n` +
-      `Experience Ethiopia's premier real-time multiplayer 5x5 Bingo.\n\n` +
-      `• *Stake per Cartela:* 10 BIRR\n` +
-      `• *Max Cartelas:* 2 per room\n` +
-      `• *House Rake:* 20%\n\n` +
-      `Tap *🎮 Play* below to launch the game!`;
+    const welcome = `👑 *SHISHO BINGO*\n_Play. Win. Enjoy!_\n\nWelcome, *${user.display_name}*! Ethiopia's premier real-time multiplayer 5x5 Bingo.\n\nTap *🎮 Play* below to join a live game!`;
     await sendTelegramMessage(chatId, welcome, defaultKeyboard);
     return;
   }
 
   if (text === '💰 Balance') {
     const bal = await getAuthoritativeWallet(user.id);
-    const balMsg =
-      `💰 *Authoritative Balance*\n\n` +
-      `Available Balance: *${bal} BIRR*\n\n` +
-      `_Synchronized live with your Mini App wallet._`;
-    const inlineKb = {
-      inline_keyboard: [
-        [
-          { text: 'Deposit Funds', callback_data: 'btn_deposit' },
-          { text: 'Withdraw Funds', callback_data: 'btn_withdraw' },
-        ],
-      ],
-    };
-    await sendTelegramMessage(chatId, balMsg, inlineKb);
-    return;
-  }
-
-  if (text === '💳 Deposit') {
-    const depMsg =
-      `💳 *Deposit Instructions*\n\n` +
-      `Transfer funds via:\n` +
-      `1. *Telebirr:* \`${CONFIG.TELEBIRR_ACCOUNT}\`\n` +
-      `2. *CBE:* \`${CONFIG.CBE_ACCOUNT}\`\n\n` +
-      `Once sent, launch the *🎮 Play* Mini App and navigate to *Wallet -> Deposit* to submit your Transaction Reference.`;
-    await sendTelegramMessage(chatId, depMsg, defaultKeyboard);
-    return;
-  }
-
-  if (text === '💸 Withdraw') {
-    const bal = await getAuthoritativeWallet(user.id);
-    const wdMsg =
-      `💸 *Withdrawal System*\n\n` +
-      `Current Balance: *${bal} BIRR*\n` +
-      `• Minimum: *${CONFIG.MIN_WITHDRAWAL} BIRR*\n` +
-      `• Balance to retain: *${CONFIG.MIN_REMAINING_BALANCE} BIRR*\n\n` +
-      `Open *🎮 Play* -> *Wallet* -> *Withdraw* to request cashout.`;
-    await sendTelegramMessage(chatId, wdMsg, defaultKeyboard);
-    return;
-  }
-
-  if (text === '👤 Profile') {
-    const bal = await getAuthoritativeWallet(user.id);
-    const winsRes = await query('SELECT COUNT(*) FROM game_winners WHERE user_id = $1', [user.id]);
-    const gamesRes = await query('SELECT COUNT(*) FROM room_players WHERE user_id = $1', [user.id]);
-    const refRes = await query('SELECT COUNT(*) FROM users WHERE referred_by = $1', [user.id]);
-
-    const prof =
-      `👤 *User Profile*\n\n` +
-      `Name: *${user.display_name}*\n` +
-      `Username: @${user.telegram_username || 'N/A'}\n` +
-      `Telegram ID: \`${user.telegram_id}\`\n` +
-      `Balance: *${bal} BIRR*\n\n` +
-      `🎮 Games Played: *${gamesRes.rows[0].count}*\n` +
-      `🏆 Bingo Wins: *${winsRes.rows[0].count}*\n` +
-      `👥 Referrals: *${refRes.rows[0].count}*\n` +
-      `Member Since: *${new Date(user.created_at).toLocaleDateString()}*`;
-    await sendTelegramMessage(chatId, prof, defaultKeyboard);
-    return;
-  }
-
-  if (text === '🎁 Invite') {
-    const refLink = `https://t.me/${CONFIG.TELEGRAM_BOT_USERNAME}?start=ref_${user.referral_code}`;
-    const invMsg =
-      `🎁 *Invite & Earn*\n\n` +
-      `Share your link with friends. Earn game bonuses when they participate!\n\n` +
-      `Your Referral Link:\n\`${refLink}\``;
-    await sendTelegramMessage(chatId, invMsg, defaultKeyboard);
-    return;
-  }
-
-  if (text === '📜 History') {
-    const txs = await query(
-      'SELECT type, amount, balance_after, created_at FROM wallet_transactions WHERE user_id = $1 ORDER BY id DESC LIMIT 5',
-      [user.id]
-    );
-    let histMsg = `📜 *Recent Wallet Ledger*\n\n`;
-    if (txs.rows.length === 0) {
-      histMsg += `No transactions recorded yet.`;
-    } else {
-      txs.rows.forEach((t) => {
-        histMsg += `• *${t.type}*: ${t.amount} BIRR (Bal: ${t.balance_after})\n  _${new Date(t.created_at).toLocaleTimeString()}_\n`;
-      });
-    }
-    await sendTelegramMessage(chatId, histMsg, defaultKeyboard);
-    return;
-  }
-
-  if (text === '🆘 Support') {
-    await sendTelegramMessage(
-      chatId,
-      `🆘 *Customer Support*\n\nContact our 24/7 dedicated support representative: @${CONFIG.SUPPORT_USERNAME}`,
-      defaultKeyboard
-    );
+    await sendTelegramMessage(chatId, `💰 *Available Balance:* *${bal} BIRR*\n_Live synced with your mini app._`, defaultKeyboard);
     return;
   }
 }
 
 // ============================================================================
-// 11. REST API ROUTER & CONTROLLERS
+// 10. REST API ROUTER
 // ============================================================================
 function jsonResponse(res, statusCode, data) {
   res.writeHead(statusCode, {
@@ -1083,13 +794,16 @@ async function authenticateRequest(req) {
     if (!tgUser) return null;
     return await findOrCreateUser(tgUser);
   }
+  // Local/Dev fallback account for direct browser testing outside Telegram WebApp
+  if (process.env.NODE_ENV !== 'production' || !CONFIG.TELEGRAM_BOT_TOKEN) {
+    return await findOrCreateUser({ id: 999999999, first_name: 'Test', username: 'tester' });
+  }
   return null;
 }
 
 async function handleApiRequest(req, res, parsedUrl) {
   const pathname = parsedUrl.pathname;
 
-  // 1. Health Endpoint
   if (req.method === 'GET' && pathname === '/api/health') {
     try {
       await query('SELECT 1');
@@ -1099,24 +813,20 @@ async function handleApiRequest(req, res, parsedUrl) {
     }
   }
 
-  // 2. Telegram Webhook Endpoint
   if (req.method === 'POST' && pathname === '/api/telegram/webhook') {
     let body = '';
     req.on('data', (c) => (body += c));
     req.on('end', async () => {
       try {
-        const payload = JSON.parse(body);
-        await handleTelegramWebhook(payload);
+        await handleTelegramWebhook(JSON.parse(body));
         return jsonResponse(res, 200, { ok: true });
       } catch (err) {
-        console.error('Webhook processing error:', err);
         return jsonResponse(res, 200, { ok: false, error: err.message });
       }
     });
     return;
   }
 
-  // Handle pre-flight CORS
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
@@ -1126,32 +836,22 @@ async function handleApiRequest(req, res, parsedUrl) {
     return res.end();
   }
 
-  // Authentication Required for all core user endpoints
   const authUser = await authenticateRequest(req);
 
-  // 3. User & Authoritative Wallet Endpoint
   if (req.method === 'GET' && pathname === '/api/wallet') {
-    if (!authUser) {
-      return jsonResponse(res, 401, { success: false, error: 'AUTH_REQUIRED', message: 'Valid Telegram initData required' });
-    }
+    if (!authUser) return jsonResponse(res, 401, { success: false, error: 'AUTH_REQUIRED' });
     try {
       const balance = await getAuthoritativeWallet(authUser.id);
       return jsonResponse(res, 200, {
         success: true,
-        user: {
-          id: authUser.id,
-          telegram_id: authUser.telegram_id,
-          display_name: authUser.display_name,
-          username: authUser.telegram_username,
-        },
-        balance: balance,
+        user: { id: authUser.id, display_name: authUser.display_name, telegram_id: authUser.telegram_id },
+        balance,
       });
     } catch (e) {
       return jsonResponse(res, 500, { success: false, error: 'WALLET_READ_ERROR', message: e.message });
     }
   }
 
-  // 4. Room List Endpoint
   if (req.method === 'GET' && pathname === '/api/rooms') {
     try {
       const roomsRes = await query(`
@@ -1171,11 +871,10 @@ async function handleApiRequest(req, res, parsedUrl) {
     }
   }
 
-  // 5. Cartelas Catalog Endpoint
   if (req.method === 'GET' && pathname === '/api/cartelas') {
     const roomId = parsedUrl.query.roomId;
     try {
-      const allCartelas = await query('SELECT id, cartela_number, matrix FROM cartelas ORDER BY cartela_number ASC');
+      const all = await query('SELECT id, cartela_number, matrix FROM cartelas ORDER BY cartela_number ASC');
       let takenIds = [];
       let myIds = [];
 
@@ -1187,28 +886,20 @@ async function handleApiRequest(req, res, parsedUrl) {
         }
       }
 
-      return jsonResponse(res, 200, {
-        success: true,
-        cartelas: allCartelas.rows,
-        takenCartelaIds: takenIds,
-        myCartelaIds: myIds,
-      });
+      return jsonResponse(res, 200, { success: true, cartelas: all.rows, takenCartelaIds: takenIds, myCartelaIds: myIds });
     } catch (e) {
       return jsonResponse(res, 500, { success: false, error: 'DATABASE_ERROR', message: e.message });
     }
   }
 
-  // 6. Cartela Purchase Endpoint
   if (req.method === 'POST' && pathname === '/api/cartela/purchase') {
     if (!authUser) return jsonResponse(res, 401, { success: false, error: 'AUTH_REQUIRED' });
-
     let body = '';
     req.on('data', (c) => (body += c));
     req.on('end', async () => {
       try {
         const { roomId, cartelaIds } = JSON.parse(body);
         const result = await purchaseCartelasAtomic(authUser.id, roomId, cartelaIds);
-        // Attempt trigger auto-start if capacity/threshold reached
         await tryAutoStartRoom(roomId);
         return jsonResponse(res, 200, result);
       } catch (e) {
@@ -1218,15 +909,11 @@ async function handleApiRequest(req, res, parsedUrl) {
     return;
   }
 
-  // 7. Live Game State Endpoint (Drives the Serverless Tick Engine)
   if (req.method === 'GET' && pathname === '/api/game/state') {
     const roomId = parsedUrl.query.roomId;
     if (!roomId) return jsonResponse(res, 400, { success: false, error: 'ROOM_ID_REQUIRED' });
-
     try {
-      // Advance tick if ready
       await tickGameEngine(roomId);
-
       const gRes = await query('SELECT * FROM games WHERE room_id = $1', [roomId]);
       const rRes = await query('SELECT * FROM rooms WHERE id = $1', [roomId]);
 
@@ -1239,13 +926,12 @@ async function handleApiRequest(req, res, parsedUrl) {
 
       const game = gRes.rows[0];
       const winnersRes = await query(
-        `SELECT gw.*, u.display_name, c.cartela_number 
-         FROM game_winners gw 
-         JOIN users u ON u.id = gw.user_id 
-         JOIN cartelas c ON c.id = gw.cartela_id 
-         WHERE gw.game_id = $1`,
+        `SELECT gw.*, u.display_name, c.cartela_number FROM game_winners gw 
+         JOIN users u ON u.id = gw.user_id JOIN cartelas c ON c.id = gw.cartela_id WHERE gw.game_id = $1`,
         [game.id]
       );
+
+      const called = typeof game.called_numbers === 'string' ? JSON.parse(game.called_numbers) : game.called_numbers;
 
       return jsonResponse(res, 200, {
         success: true,
@@ -1253,8 +939,8 @@ async function handleApiRequest(req, res, parsedUrl) {
           id: game.id,
           roomId: game.room_id,
           status: game.status,
-          calledNumbers: typeof game.called_numbers === 'string' ? JSON.parse(game.called_numbers) : game.called_numbers,
-          currentNumber: game.called_numbers?.length > 0 ? game.called_numbers[game.called_numbers.length - 1] : null,
+          calledNumbers: called,
+          currentNumber: called.length > 0 ? called[called.length - 1] : null,
           totalPot: game.total_pot,
           prizePool: game.prize_pool,
           winners: winnersRes.rows,
@@ -1266,10 +952,8 @@ async function handleApiRequest(req, res, parsedUrl) {
     }
   }
 
-  // 8. Bingo Claim Endpoint
   if (req.method === 'POST' && pathname === '/api/game/bingo') {
     if (!authUser) return jsonResponse(res, 401, { success: false, error: 'AUTH_REQUIRED' });
-
     let body = '';
     req.on('data', (c) => (body += c));
     req.on('end', async () => {
@@ -1278,13 +962,12 @@ async function handleApiRequest(req, res, parsedUrl) {
         const result = await claimBingoAtomic(authUser.id, roomId, cartelaId);
         return jsonResponse(res, 200, result);
       } catch (e) {
-        return jsonResponse(res, 400, { success: false, error: 'BINGO_VERIFICATION_FAILED', message: e.message });
+        return jsonResponse(res, 400, { success: false, error: 'BINGO_VERIFY_FAILED', message: e.message });
       }
     });
     return;
   }
 
-  // 9. Deposit Creation Endpoint
   if (req.method === 'POST' && pathname === '/api/deposit') {
     if (!authUser) return jsonResponse(res, 401, { success: false, error: 'AUTH_REQUIRED' });
     let body = '';
@@ -1295,13 +978,12 @@ async function handleApiRequest(req, res, parsedUrl) {
         const dep = await createDepositAtomic(authUser.id, amount, paymentMethod, transactionId);
         return jsonResponse(res, 200, { success: true, deposit: dep });
       } catch (e) {
-        return jsonResponse(res, 400, { success: false, error: 'DEPOSIT_ERROR', message: e.message });
+        return jsonResponse(res, 400, { success: false, error: 'DEPOSIT_FAILED', message: e.message });
       }
     });
     return;
   }
 
-  // 10. Withdrawal Creation Endpoint
   if (req.method === 'POST' && pathname === '/api/withdraw') {
     if (!authUser) return jsonResponse(res, 401, { success: false, error: 'AUTH_REQUIRED' });
     let body = '';
@@ -1309,255 +991,465 @@ async function handleApiRequest(req, res, parsedUrl) {
     req.on('end', async () => {
       try {
         const { amount, paymentMethod, accountNumber, accountHolder } = JSON.parse(body);
-        const result = await createWithdrawalAtomic(authUser.id, amount, paymentMethod, accountNumber, accountHolder);
-        return jsonResponse(res, 200, result);
+        const resWd = await createWithdrawalAtomic(authUser.id, amount, paymentMethod, accountNumber, accountHolder);
+        return jsonResponse(res, 200, resWd);
       } catch (e) {
-        return jsonResponse(res, 400, { success: false, error: 'WITHDRAWAL_ERROR', message: e.message });
+        return jsonResponse(res, 400, { success: false, error: 'WITHDRAW_FAILED', message: e.message });
       }
     });
     return;
   }
 
-  // 11. Transaction History Endpoint
   if (req.method === 'GET' && pathname === '/api/history') {
     if (!authUser) return jsonResponse(res, 401, { success: false, error: 'AUTH_REQUIRED' });
     try {
-      const txs = await query(
-        'SELECT * FROM wallet_transactions WHERE user_id = $1 ORDER BY id DESC LIMIT 50',
-        [authUser.id]
-      );
+      const txs = await query('SELECT * FROM wallet_transactions WHERE user_id = $1 ORDER BY id DESC LIMIT 50', [
+        authUser.id,
+      ]);
       return jsonResponse(res, 200, { success: true, transactions: txs.rows });
     } catch (e) {
-      return jsonResponse(res, 500, { success: false, error: 'DATABASE_ERROR', message: e.message });
+      return jsonResponse(res, 500, { success: false, error: 'DB_ERROR', message: e.message });
     }
   }
 
-  // 12. Admin Action Endpoints (Protected by Super Admin Telegram ID check)
-  if (pathname.startsWith('/api/admin/')) {
-    if (!authUser || String(authUser.telegram_id) !== CONFIG.ADMIN_TELEGRAM_ID) {
-      return jsonResponse(res, 403, { success: false, error: 'UNAUTHORIZED_ADMIN' });
-    }
-
-    if (req.method === 'POST' && pathname === '/api/admin/deposits/approve') {
-      let body = '';
-      req.on('data', (c) => (body += c));
-      req.on('end', async () => {
-        try {
-          const { depositId, notes } = JSON.parse(body);
-          const result = await approveDepositAtomic(depositId, notes);
-          return jsonResponse(res, 200, result);
-        } catch (e) {
-          return jsonResponse(res, 400, { success: false, error: e.message });
-        }
-      });
-      return;
-    }
-  }
-
-  // Fallback 404
-  return jsonResponse(res, 404, { success: false, error: 'ENDPOINT_NOT_FOUND' });
+  return jsonResponse(res, 404, { success: false, error: 'NOT_FOUND' });
 }
 
 // ============================================================================
-// 12. EMBEDDED MINI APP (HTML, CSS, JAVASCRIPT)
+// 11. REDESIGNED EMBEDDED MINI APP (HTML, CSS & JS)
 // ============================================================================
 function getMiniAppHTML() {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>Shisho Bingo</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
     :root {
-      --bg-dark: #0a0612;
-      --bg-card: rgba(26, 16, 43, 0.7);
-      --purple-accent: #7928ca;
-      --gold-primary: #ffb800;
-      --gold-glow: rgba(255, 184, 0, 0.35);
-      --text-main: #f3f0f7;
-      --text-muted: #9f96b0;
-      --border-glass: rgba(255, 255, 255, 0.08);
-      --success: #00e676;
-      --danger: #ff1744;
+      --bg-dark-1: #080511;
+      --bg-dark-2: #0d0718;
+      --bg-card: rgba(23, 16, 36, 0.88);
+      --bg-card-border: rgba(255, 216, 77, 0.16);
+      --primary-gold: #ffc400;
+      --bright-gold: #ffd84d;
+      --gold-glow: rgba(255, 196, 0, 0.4);
+      --purple-main: #6c3ccf;
+      --purple-bright: #8e5bef;
+      --purple-glow: rgba(110, 60, 207, 0.4);
+      --text-white: #ffffff;
+      --text-secondary: #a9a1b8;
+      --text-muted: #6f6680;
+      --success: #22c55e;
+      --danger: #ef4444;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }
-    body { background-color: var(--bg-dark); color: var(--text-main); min-height: 100vh; padding-bottom: 80px; overflow-x: hidden; }
-    
-    /* Header & Balance Card */
-    .header { padding: 16px 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-glass); background: rgba(10, 6, 18, 0.85); backdrop-filter: blur(12px); position: sticky; top: 0; z-index: 100; }
-    .brand { font-size: 20px; font-weight: 800; color: var(--gold-primary); text-transform: uppercase; letter-spacing: 1px; display: flex; align-items: center; gap: 8px; }
-    .wallet-pill { background: linear-gradient(135deg, rgba(121, 40, 202, 0.4), rgba(255, 184, 0, 0.15)); border: 1px solid var(--gold-primary); padding: 6px 14px; border-radius: 20px; font-weight: 700; color: var(--gold-primary); display: flex; align-items: center; gap: 6px; box-shadow: 0 0 12px var(--gold-glow); }
-    
-    /* Navigation */
-    .tab-content { display: none; padding: 16px; animation: fadeIn 0.25s ease-out; }
-    .tab-content.active { display: block; }
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-    
-    .nav-bar { position: fixed; bottom: 0; left: 0; right: 0; height: 68px; background: rgba(15, 9, 28, 0.95); backdrop-filter: blur(16px); border-top: 1px solid var(--border-glass); display: flex; justify-content: space-around; align-items: center; z-index: 100; }
-    .nav-item { display: flex; flex-direction: column; align-items: center; gap: 4px; color: var(--text-muted); font-size: 11px; font-weight: 600; text-decoration: none; cursor: pointer; flex: 1; }
-    .nav-item.active { color: var(--gold-primary); }
-    .nav-item svg { width: 22px; height: 22px; fill: currentColor; }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; -webkit-tap-highlight-color: transparent; }
+    body { background: radial-gradient(circle at 50% 10%, #1a0b30 0%, var(--bg-dark-1) 100%); color: var(--text-white); min-height: 100vh; display: flex; justify-content: center; }
 
-    /* Common Card Styling */
-    .glass-card { background: var(--bg-card); border: 1px solid var(--border-glass); border-radius: 16px; padding: 18px; margin-bottom: 16px; backdrop-filter: blur(8px); }
-    .btn { width: 100%; padding: 14px; border: none; border-radius: 12px; font-size: 15px; font-weight: 700; cursor: pointer; text-transform: uppercase; letter-spacing: 0.5px; transition: transform 0.1s, opacity 0.2s; }
-    .btn-gold { background: linear-gradient(135deg, #ffb800, #ff8800); color: #000; box-shadow: 0 4px 16px var(--gold-glow); }
-    .btn-purple { background: linear-gradient(135deg, #7928ca, #4a00e0); color: #fff; }
-    .btn:active { transform: scale(0.98); opacity: 0.9; }
+    /* Centered Mobile-First Device Shell */
+    .app-viewport { width: 100%; max-width: 460px; min-height: 100vh; position: relative; padding-bottom: 84px; display: flex; flex-direction: column; }
 
-    /* Rooms Grid */
-    .room-card { display: flex; justify-content: space-between; align-items: center; border-left: 4px solid var(--gold-primary); }
-    .room-title { font-size: 16px; font-weight: 700; color: #fff; margin-bottom: 4px; }
-    .room-meta { font-size: 13px; color: var(--text-muted); }
+    /* Top Gaming Header */
+    .app-header { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; background: rgba(13, 7, 24, 0.85); backdrop-filter: blur(14px); position: sticky; top: 0; z-index: 100; border-bottom: 1px solid var(--bg-card-border); }
+    .brand-cluster { display: flex; align-items: center; gap: 8px; }
+    .brand-crown { font-size: 20px; filter: drop-shadow(0 0 6px var(--gold-glow)); }
+    .brand-title { font-size: 16px; font-weight: 900; letter-spacing: 0.5px; background: linear-gradient(180deg, #fff 0%, var(--bright-gold) 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    .brand-tag { font-size: 9px; text-transform: uppercase; color: var(--purple-bright); font-weight: 700; letter-spacing: 1px; }
 
-    /* Cartela Matrix UI */
-    .cartela-picker-container { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-top: 12px; }
-    .cartela-item { border: 1px solid var(--border-glass); border-radius: 12px; padding: 12px; text-align: center; cursor: pointer; background: rgba(255, 255, 255, 0.03); }
-    .cartela-item.selected { border-color: var(--gold-primary); background: rgba(255, 184, 0, 0.15); box-shadow: 0 0 10px var(--gold-glow); }
-    .cartela-item.taken { opacity: 0.3; cursor: not-allowed; }
+    .balance-pill { background: linear-gradient(135deg, rgba(108, 60, 207, 0.45), rgba(255, 196, 0, 0.12)); border: 1.5px solid var(--primary-gold); padding: 5px 12px; border-radius: 20px; display: flex; align-items: center; gap: 6px; cursor: pointer; box-shadow: 0 0 10px var(--gold-glow); transition: transform 0.15s; }
+    .balance-pill:active { transform: scale(0.96); }
+    .balance-text { font-size: 13px; font-weight: 800; color: var(--bright-gold); }
 
-    .bingo-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; margin: 16px 0; }
-    .bingo-cell { aspect-ratio: 1; display: flex; align-items: center; justify-content: center; background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border-glass); border-radius: 8px; font-weight: 700; font-size: 14px; }
-    .bingo-cell.header { background: transparent; border: none; color: var(--gold-primary); font-size: 16px; font-weight: 900; }
-    .bingo-cell.marked { background: var(--purple-accent); color: #fff; border-color: var(--gold-primary); }
-    .bingo-cell.free { background: var(--gold-primary); color: #000; font-size: 11px; }
+    /* Screen Views */
+    .screen-view { display: none; padding: 14px 16px; animation: screenFade 0.2s ease-in-out; }
+    .screen-view.active { display: block; }
+    @keyframes screenFade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
-    /* Number Caller Display */
-    .caller-board { text-align: center; padding: 20px; border: 2px solid var(--purple-accent); background: radial-gradient(circle, rgba(121,40,202,0.3) 0%, rgba(10,6,18,0) 70%); border-radius: 20px; margin-bottom: 16px; }
-    .current-number { font-size: 64px; font-weight: 900; color: var(--gold-primary); text-shadow: 0 0 20px var(--gold-glow); line-height: 1; margin: 10px 0; }
-    .called-ribbon { display: flex; gap: 8px; overflow-x: auto; padding: 10px 0; scrollbar-width: none; }
-    .ribbon-pill { min-width: 36px; height: 36px; border-radius: 50%; background: var(--bg-card); border: 1px solid var(--gold-primary); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 13px; color: #fff; }
+    /* Reusable Cards & Components */
+    .hero-banner { background: linear-gradient(135deg, rgba(110, 60, 207, 0.4) 0%, rgba(26, 16, 48, 0.8) 100%); border: 1.5px solid rgba(255, 196, 0, 0.28); border-radius: 18px; padding: 18px; text-align: center; position: relative; overflow: hidden; margin-bottom: 16px; box-shadow: 0 6px 20px rgba(0,0,0,0.5); }
+    .hero-banner::before { content: ''; position: absolute; top: -50%; left: -50%; width: 200%; height: 200%; background: radial-gradient(circle, var(--gold-glow) 0%, transparent 60%); opacity: 0.15; pointer-events: none; }
+    .hero-title { font-size: 24px; font-weight: 900; color: var(--bright-gold); text-transform: uppercase; letter-spacing: 1px; }
+    .hero-subtitle { font-size: 13px; color: var(--text-secondary); margin-top: 4px; }
+    .hero-tags { display: flex; justify-content: center; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+    .hero-badge { background: rgba(0, 0, 0, 0.35); border: 1px solid rgba(255, 255, 255, 0.1); padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; color: var(--text-white); }
 
-    /* Forms */
-    .input-field { width: 100%; padding: 14px; border-radius: 12px; background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border-glass); color: #fff; font-size: 15px; margin-bottom: 12px; }
-    .input-field:focus { outline: none; border-color: var(--gold-primary); }
+    .quick-actions-bar { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 16px; }
+    .action-button { background: var(--bg-card); border: 1px solid var(--bg-card-border); border-radius: 14px; padding: 10px 4px; display: flex; flex-direction: column; align-items: center; gap: 4px; cursor: pointer; transition: transform 0.1s, border-color 0.15s; }
+    .action-button:active { transform: scale(0.95); border-color: var(--primary-gold); }
+    .action-icon { font-size: 18px; }
+    .action-label { font-size: 11px; font-weight: 700; color: var(--text-secondary); }
+
+    /* Bingo Room Cards */
+    .section-title { font-size: 14px; font-weight: 800; color: var(--bright-gold); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; }
+    .room-card-v2 { background: var(--bg-card); border: 1.5px solid var(--bg-card-border); border-radius: 16px; padding: 14px 16px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 4px 14px rgba(0,0,0,0.3); }
+    .room-card-v2:hover { border-color: var(--primary-gold); }
+    .room-header-tag { font-size: 15px; font-weight: 800; color: #fff; margin-bottom: 6px; }
+    .room-specs { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--text-secondary); }
+    .room-specs strong { color: var(--bright-gold); }
+
+    .btn-gold-cta { background: linear-gradient(180deg, #ffd84d 0%, #ffaa00 100%); color: #090510; border: none; font-weight: 900; font-size: 13px; padding: 10px 18px; border-radius: 12px; cursor: pointer; text-transform: uppercase; box-shadow: 0 3px 12px var(--gold-glow); transition: transform 0.1s; }
+    .btn-gold-cta:active { transform: scale(0.96); }
+
+    /* Cartela Selection Tickets Grid */
+    .cartela-grid-container { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin: 12px 0; }
+    .ticket-card { background: rgba(23, 16, 36, 0.95); border: 1.5px solid rgba(255,255,255,0.08); border-radius: 14px; padding: 10px; cursor: pointer; transition: all 0.15s ease; position: relative; }
+    .ticket-card.selected { border-color: var(--primary-gold); background: rgba(255, 196, 0, 0.08); box-shadow: 0 0 12px var(--gold-glow); }
+    .ticket-card.taken { opacity: 0.25; cursor: not-allowed; }
+    .ticket-header { display: flex; justify-content: space-between; font-size: 12px; font-weight: 800; color: var(--bright-gold); margin-bottom: 6px; }
+    .ticket-mini-matrix { display: grid; grid-template-columns: repeat(5, 1fr); gap: 2px; }
+    .mini-cell { aspect-ratio: 1; background: rgba(255,255,255,0.04); border-radius: 3px; font-size: 8px; display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-weight: 600; }
+    .mini-cell.free-cell { background: var(--purple-main); color: #fff; }
+
+    /* Live Bingo Screen (Screenshot 2 Match) */
+    .live-game-header-bar { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; background: var(--bg-card); border: 1px solid var(--bg-card-border); border-radius: 14px; padding: 8px; text-align: center; margin-bottom: 12px; }
+    .stat-label { font-size: 9px; text-transform: uppercase; color: var(--text-muted); font-weight: 700; }
+    .stat-val { font-size: 14px; font-weight: 900; color: var(--bright-gold); }
+
+    .ball-caller-podium { background: radial-gradient(circle at 50% 50%, rgba(108, 60, 207, 0.45) 0%, rgba(10, 5, 20, 0) 70%); border: 2px solid var(--purple-main); border-radius: 20px; padding: 16px; text-align: center; margin-bottom: 12px; position: relative; }
+    .ball-halo { width: 84px; height: 84px; border-radius: 50%; background: linear-gradient(135deg, #ffd84d 0%, #ff8c00 100%); margin: 0 auto; display: flex; flex-direction: column; align-items: center; justify-content: center; box-shadow: 0 0 24px var(--gold-glow); animation: pulseBall 1.5s infinite alternate; }
+    @keyframes pulseBall { from { transform: scale(0.96); } to { transform: scale(1.03); } }
+    .ball-letter { font-size: 13px; font-weight: 900; color: rgba(0, 0, 0, 0.7); line-height: 1; }
+    .ball-digit { font-size: 36px; font-weight: 900; color: #000; line-height: 1; }
+
+    .recent-calls-strip { display: flex; gap: 8px; justify-content: center; overflow-x: auto; padding: 8px 0; margin-bottom: 12px; scrollbar-width: none; }
+    .recent-pill { width: 34px; height: 34px; border-radius: 50%; background: var(--bg-card); border: 1.5px solid var(--primary-gold); color: #fff; font-size: 12px; font-weight: 800; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+
+    /* Interactive 5x5 Bingo Matrix */
+    .cartela-board { background: var(--bg-card); border: 1.5px solid var(--bg-card-border); border-radius: 16px; padding: 10px; margin-bottom: 12px; }
+    .board-header { font-size: 12px; font-weight: 800; color: var(--bright-gold); text-align: center; margin-bottom: 8px; }
+    .matrix-5x5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; }
+    .col-letter { text-align: center; font-weight: 900; color: var(--bright-gold); font-size: 15px; padding-bottom: 4px; }
+    .cell-val { aspect-ratio: 1; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 800; color: #fff; }
+    .cell-val.marked { background: linear-gradient(135deg, var(--purple-main) 0%, var(--purple-bright) 100%); color: #fff; border-color: var(--bright-gold); box-shadow: 0 0 8px var(--purple-glow); }
+    .cell-val.free-spot { background: linear-gradient(135deg, var(--primary-gold) 0%, #ff8c00 100%); color: #000; font-size: 10px; font-weight: 900; }
+
+    /* Winner Overlay Celebration Screen */
+    .winner-overlay { position: fixed; inset: 0; background: rgba(5, 2, 12, 0.94); backdrop-filter: blur(12px); display: none; flex-direction: column; align-items: center; justify-content: center; z-index: 200; padding: 24px; text-align: center; }
+    .winner-overlay.active { display: flex; animation: zoomIn 0.3s cubic-bezier(0.18, 0.89, 0.32, 1.28); }
+    @keyframes zoomIn { from { transform: scale(0.85); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+    /* Bottom Navigation Bar */
+    .app-bottom-nav { position: fixed; bottom: 0; left: 50%; transform: translateX(-50%); width: 100%; max-width: 460px; height: 68px; background: rgba(13, 7, 24, 0.95); backdrop-filter: blur(16px); border-top: 1.5px solid var(--bg-card-border); border-top-left-radius: 18px; border-top-right-radius: 18px; display: flex; justify-content: space-around; align-items: center; z-index: 99; }
+    .nav-btn { display: flex; flex-direction: column; align-items: center; gap: 4px; background: none; border: none; color: var(--text-muted); cursor: pointer; flex: 1; }
+    .nav-btn.active { color: var(--bright-gold); }
+    .nav-btn svg { width: 22px; height: 22px; fill: currentColor; }
+    .nav-btn-text { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; }
+
+    /* Forms & Interactive Modals */
+    .form-group { margin-bottom: 12px; }
+    .form-label { font-size: 11px; font-weight: 700; color: var(--text-secondary); margin-bottom: 4px; display: block; }
+    .input-box { width: 100%; padding: 12px 14px; border-radius: 12px; background: rgba(255, 255, 255, 0.05); border: 1.5px solid var(--bg-card-border); color: #fff; font-size: 14px; }
+    .input-box:focus { outline: none; border-color: var(--primary-gold); }
   </style>
 </head>
 <body>
 
-  <!-- Authoritative Header -->
-  <div class="header">
-    <div class="brand">
-      <span>SHISHO</span>
-    </div>
-    <div class="wallet-pill" id="wallet-badge" onclick="switchTab('wallet')">
-      <span id="header-balance">Loading...</span>
-    </div>
-  </div>
+  <div class="app-viewport">
+    
+    <!-- Top Header -->
+    <header class="app-header">
+      <div class="brand-cluster">
+        <span class="brand-crown">👑</span>
+        <div>
+          <div class="brand-title">SHISHO BINGO</div>
+          <div class="brand-tag">Play. Win. Enjoy!</div>
+        </div>
+      </div>
+      <div class="balance-pill" onclick="switchView('wallet')">
+        <span>💰</span>
+        <span class="balance-text" id="header-wallet-bal">...</span>
+      </div>
+    </header>
 
-  <!-- TAB 1: PLAY / ROOMS -->
-  <div id="tab-play" class="tab-content active">
-    <div class="glass-card">
-      <h3 style="color: var(--gold-primary); margin-bottom: 8px;">Multiplayer Bingo 🇪🇹</h3>
-      <p style="color: var(--text-muted); font-size: 14px;">Select an active waiting room, pick your cartelas, and compete live.</p>
+    <!-- VIEW 1: HOME / LOBBY -->
+    <main id="view-home" class="screen-view active">
+      <div class="hero-banner">
+        <div style="font-size: 32px; margin-bottom: 6px;">👑</div>
+        <div class="hero-title">SHISHO BINGO</div>
+        <div class="hero-subtitle">Ethiopia's #1 Real-Time Multiplayer Network</div>
+        <div class="hero-tags">
+          <span class="hero-badge">⚡ Instant Payouts</span>
+          <span class="hero-badge">🔒 100% Fair Draw</span>
+          <span class="hero-badge">👥 Active Rooms</span>
+        </div>
+      </div>
+
+      <!-- Quick Actions Strip -->
+      <div class="quick-actions-bar">
+        <div class="action-button" onclick="switchView('wallet')">
+          <div class="action-icon">💳</div>
+          <div class="action-label" data-i18n="deposit">Deposit</div>
+        </div>
+        <div class="action-button" onclick="switchView('wallet')">
+          <div class="action-icon">💸</div>
+          <div class="action-label" data-i18n="withdraw">Withdraw</div>
+        </div>
+        <div class="action-button" onclick="switchView('invite')">
+          <div class="action-icon">🎁</div>
+          <div class="action-label" data-i18n="invite">Invite</div>
+        </div>
+        <div class="action-button" onclick="switchView('profile')">
+          <div class="action-icon">👤</div>
+          <div class="action-label" data-i18n="profile">Profile</div>
+        </div>
+      </div>
+
+      <!-- Available Rooms -->
+      <div class="section-title">
+        <span data-i18n="availableRooms">Available Rooms</span>
+        <span style="font-size: 11px; color: var(--purple-bright); cursor: pointer;" onclick="loadRooms()">🔄 Refresh</span>
+      </div>
+      <div id="rooms-feed-list">
+        <!-- Rendered via loadRooms() -->
+      </div>
+    </main>
+
+    <!-- VIEW 2: CARTELA SELECTION TICKET LOBBY -->
+    <section id="view-cartela-picker" class="screen-view">
+      <div class="section-title">
+        <span>Select Tickets (Max 2)</span>
+        <span style="color: var(--text-muted); font-size: 12px;" id="picker-room-info">Room #0000</span>
+      </div>
+      <div style="font-size: 12px; color: var(--text-secondary); margin-bottom: 10px;">
+        Stake: <strong style="color: var(--bright-gold);">10 BIRR</strong> per cartela.
+      </div>
+
+      <div class="cartela-grid-container" id="cartela-selectable-feed">
+        <!-- Injected Ticket Previews -->
+      </div>
+
+      <div style="background: var(--bg-card); border: 1.5px solid var(--bg-card-border); border-radius: 14px; padding: 12px; margin-top: 14px;">
+        <div style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 6px;">
+          <span>Selected Count:</span>
+          <strong id="summary-cartela-count" style="color: var(--bright-gold);">0 / 2</strong>
+        </div>
+        <div style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 12px;">
+          <span>Total Deduction:</span>
+          <strong id="summary-total-cost" style="color: var(--bright-gold);">0.00 BIRR</strong>
+        </div>
+        <button class="btn-gold-cta" style="width: 100%;" onclick="confirmCartelaPurchase()">CONFIRM & JOIN GAME</button>
+      </div>
+    </section>
+
+    <!-- VIEW 3: LIVE BINGO GAME ROOM -->
+    <section id="view-live-game" class="screen-view">
+      <!-- Live Game Header -->
+      <div class="live-game-header-bar">
+        <div>
+          <div class="stat-label">POT</div>
+          <div class="stat-val" id="game-pot-val">0</div>
+        </div>
+        <div>
+          <div class="stat-label">PLAYERS</div>
+          <div class="stat-val" id="game-players-val">0</div>
+        </div>
+        <div>
+          <div class="stat-label">STAKE</div>
+          <div class="stat-val">10</div>
+        </div>
+        <div>
+          <div class="stat-label">CALL #</div>
+          <div class="stat-val" id="game-call-index">0</div>
+        </div>
+      </div>
+
+      <!-- Current Ball Caller Podium -->
+      <div class="ball-caller-podium">
+        <div class="ball-halo">
+          <div class="ball-letter" id="current-ball-letter">-</div>
+          <div class="ball-digit" id="current-ball-number">-</div>
+        </div>
+        <div style="font-size: 11px; color: var(--bright-gold); margin-top: 8px;" id="game-next-timer">Next Call: 5s</div>
+      </div>
+
+      <!-- Recent Number Ribbon -->
+      <div class="recent-calls-strip" id="recent-calls-ribbon"></div>
+
+      <!-- My Active Cartela Boards -->
+      <div id="live-cartelas-container"></div>
+
+      <button class="btn-gold-cta" style="width: 100%; margin-top: 8px;" onclick="claimBingoVictory()">🏆 BINGO!</button>
+    </section>
+
+    <!-- VIEW 4: WALLET -->
+    <section id="view-wallet" class="screen-view">
+      <div class="hero-banner" style="padding: 14px;">
+        <div style="font-size: 11px; text-transform: uppercase; color: var(--text-secondary);">Authoritative Balance</div>
+        <div style="font-size: 32px; font-weight: 900; color: var(--bright-gold); margin: 6px 0;" id="wallet-balance-big">0.00 BIRR</div>
+        <div style="font-size: 11px; color: var(--text-muted);">Synchronized across Bot & Mini App</div>
+      </div>
+
+      <div class="section-title"><span>Deposit Funds</span></div>
+      <div style="background: var(--bg-card); border: 1.5px solid var(--bg-card-border); border-radius: 14px; padding: 14px; margin-bottom: 16px;">
+        <div class="form-group">
+          <label class="form-label">Payment Method</label>
+          <select class="input-box" id="inp-dep-method">
+            <option value="TELEBIRR">Telebirr (${CONFIG.TELEBIRR_ACCOUNT})</option>
+            <option value="CBE">CBE (${CONFIG.CBE_ACCOUNT})</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Amount (BIRR)</label>
+          <input type="number" class="input-box" id="inp-dep-amt" placeholder="e.g. 100">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Transaction Reference ID</label>
+          <input type="text" class="input-box" id="inp-dep-txid" placeholder="Paste bank confirmation code">
+        </div>
+        <button class="btn-gold-cta" style="width: 100%;" onclick="submitDepositOrder()">Submit Deposit</button>
+      </div>
+
+      <div class="section-title"><span>Withdraw Funds</span></div>
+      <div style="background: var(--bg-card); border: 1.5px solid var(--bg-card-border); border-radius: 14px; padding: 14px;">
+        <div class="form-group">
+          <label class="form-label">Payout Method</label>
+          <select class="input-box" id="inp-wd-method">
+            <option value="TELEBIRR">Telebirr</option>
+            <option value="CBE">Commercial Bank of Ethiopia</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Amount (Min ${CONFIG.MIN_WITHDRAWAL} BIRR)</label>
+          <input type="number" class="input-box" id="inp-wd-amt" placeholder="Amount">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Account / Phone Number</label>
+          <input type="text" class="input-box" id="inp-wd-acc" placeholder="Target Account">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Account Holder Full Name</label>
+          <input type="text" class="input-box" id="inp-wd-name" placeholder="Full Name">
+        </div>
+        <button class="btn-gold-cta" style="width: 100%; background: linear-gradient(180deg, var(--purple-bright) 0%, var(--purple-main) 100%); color: #fff;" onclick="submitWithdrawOrder()">Request Cashout</button>
+      </div>
+    </section>
+
+    <!-- VIEW 5: HISTORY -->
+    <section id="view-history" class="screen-view">
+      <div class="section-title"><span>Transaction Ledger</span></div>
+      <div id="history-audit-list"></div>
+    </section>
+
+    <!-- VIEW 6: PROFILE & SETTINGS -->
+    <section id="view-profile" class="screen-view">
+      <div class="hero-banner" style="text-align: left; display: flex; align-items: center; gap: 14px;">
+        <div style="width: 54px; height: 54px; border-radius: 50%; background: var(--purple-main); border: 2px solid var(--primary-gold); display: flex; align-items: center; justify-content: center; font-size: 22px;">👤</div>
+        <div>
+          <div style="font-size: 16px; font-weight: 800;" id="prof-display-name">Player</div>
+          <div style="font-size: 12px; color: var(--text-secondary);" id="prof-tg-id">ID: -</div>
+        </div>
+      </div>
+
+      <div class="section-title"><span>Preferences & Audio</span></div>
+      <div style="background: var(--bg-card); border: 1.5px solid var(--bg-card-border); border-radius: 14px; padding: 14px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+          <span style="font-size: 13px;">🔊 Caller Voice Synthesizer</span>
+          <input type="checkbox" id="setting-voice" checked style="width: 20px; height: 20px;">
+        </div>
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <span style="font-size: 13px;">🌐 Language / ቋንቋ</span>
+          <select id="setting-lang" onchange="changeLanguage(this.value)" class="input-box" style="width: auto; padding: 6px 10px;">
+            <option value="en">English</option>
+            <option value="am">አማርኛ (Amharic)</option>
+          </select>
+        </div>
+      </div>
+    </section>
+
+    <!-- VIEW 7: INVITE FRIENDS -->
+    <section id="view-invite" class="screen-view">
+      <div class="hero-banner">
+        <div style="font-size: 32px; margin-bottom: 6px;">🎁</div>
+        <div class="hero-title">Invite & Earn</div>
+        <div class="hero-subtitle">Receive bonus rewards whenever friends join rooms!</div>
+      </div>
+      <div style="background: var(--bg-card); border: 1.5px solid var(--bg-card-border); border-radius: 14px; padding: 14px; text-align: center;">
+        <input type="text" class="input-box" id="invite-link-input" readonly value="https://t.me/${CONFIG.TELEGRAM_BOT_USERNAME}">
+        <button class="btn-gold-cta" style="width: 100%; margin-top: 10px;" onclick="copyInviteLink()">Copy Invite Link</button>
+      </div>
+    </section>
+
+    <!-- Full-Screen Winner Celebration Modal (Screenshot 2 Match) -->
+    <div id="winner-modal" class="winner-overlay">
+      <div style="font-size: 48px; margin-bottom: 8px;">👑</div>
+      <div style="font-size: 26px; font-weight: 900; color: var(--bright-gold); letter-spacing: 1px;">BINGO!</div>
+      <div style="font-size: 14px; color: #fff; margin-bottom: 16px;">WE HAVE A WINNER!</div>
+      
+      <div style="background: var(--bg-card); border: 2px solid var(--primary-gold); border-radius: 16px; padding: 16px; width: 100%; max-width: 320px; margin-bottom: 16px; box-shadow: 0 0 20px var(--gold-glow);">
+        <div style="font-size: 12px; color: var(--text-secondary); text-transform: uppercase;">Total Prize Pool</div>
+        <div style="font-size: 24px; font-weight: 900; color: var(--bright-gold);" id="win-modal-pot">160 BIRR</div>
+        <div style="margin: 10px 0; border-top: 1px solid var(--bg-card-border);"></div>
+        <div style="font-size: 14px; font-weight: 800;" id="win-modal-winner-name">Winner: -</div>
+        <div style="font-size: 12px; color: var(--text-secondary);" id="win-modal-cartela-num">Cartela: #-</div>
+      </div>
+      <button class="btn-gold-cta" style="width: 100%; max-width: 320px;" onclick="closeWinnerModal()">CONTINUE</button>
     </div>
 
-    <div id="rooms-container">
-      <!-- Injected Rooms -->
-    </div>
-  </div>
+    <!-- Bottom Mobile Nav Bar -->
+    <nav class="app-bottom-nav">
+      <button class="nav-btn active" id="nav-btn-home" onclick="switchView('home')">
+        <svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
+        <span class="nav-btn-text" data-i18n="play">Play</span>
+      </button>
+      <button class="nav-btn" id="nav-btn-wallet" onclick="switchView('wallet')">
+        <svg viewBox="0 0 24 24"><path d="M21 18v1c0 1.1-.9 2-2 2H5c-1.11 0-2-.9-2-2V5c0-1.1.89-2 2-2h14c1.1 0 2 .9 2 2v1h-9c-1.11 0-2 .9-2 2v8c0 1.1.89 2 2 2h9zm-9-2h10V8H12v8zm4-2.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5z"/></svg>
+        <span class="nav-btn-text" data-i18n="wallet">Wallet</span>
+      </button>
+      <button class="nav-btn" id="nav-btn-history" onclick="switchView('history')">
+        <svg viewBox="0 0 24 24"><path d="M13 3c-4.97 0-9 4.03-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42C8.27 19.99 10.51 21 13 21c4.97 0 9-4.03 9-9s-4.03-9-9-9zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg>
+        <span class="nav-btn-text" data-i18n="history">History</span>
+      </button>
+      <button class="nav-btn" id="nav-btn-profile" onclick="switchView('profile')">
+        <svg viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
+        <span class="nav-btn-text" data-i18n="profile">Profile</span>
+      </button>
+    </nav>
 
-  <!-- TAB 2: LIVE GAME SCREEN -->
-  <div id="tab-game" class="tab-content">
-    <div class="caller-board">
-      <div style="font-size: 12px; text-transform: uppercase; color: var(--text-muted); letter-spacing: 1px;">Current Call</div>
-      <div class="current-number" id="display-call">-</div>
-      <div style="font-size: 13px; color: var(--gold-primary);" id="display-timer">Next Call in 5s</div>
-      <div class="called-ribbon" id="called-history"></div>
-    </div>
-
-    <div id="game-cartelas-area"></div>
-
-    <button class="btn btn-gold" id="btn-claim-bingo" onclick="submitBingoClaim()" style="margin-top: 12px;">🏆 CLAIM BINGO!</button>
-  </div>
-
-  <!-- TAB 3: WALLET -->
-  <div id="tab-wallet" class="tab-content">
-    <div class="glass-card" style="text-align: center; border-color: var(--gold-primary);">
-      <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 6px;">Available Balance</div>
-      <div style="font-size: 36px; font-weight: 900; color: var(--gold-primary);" id="wallet-page-balance">Loading...</div>
-      <button class="btn btn-purple" style="margin-top: 12px; padding: 8px 16px; width: auto;" onclick="refreshWallet()">🔄 Refresh Balance</button>
-    </div>
-
-    <!-- Deposit Box -->
-    <div class="glass-card">
-      <h3 style="color: var(--gold-primary); margin-bottom: 12px;">Deposit Funds</h3>
-      <select class="input-field" id="dep-method">
-        <option value="TELEBIRR">Telebirr (0911002233)</option>
-        <option value="CBE">Commercial Bank of Ethiopia (1000192837465)</option>
-      </select>
-      <input type="number" class="input-field" id="dep-amount" placeholder="Amount in BIRR">
-      <input type="text" class="input-field" id="dep-txid" placeholder="Transaction Reference ID">
-      <button class="btn btn-gold" onclick="submitDeposit()">Submit Deposit</button>
-    </div>
-
-    <!-- Withdraw Box -->
-    <div class="glass-card">
-      <h3 style="color: var(--gold-primary); margin-bottom: 12px;">Withdraw Funds</h3>
-      <select class="input-field" id="wd-method">
-        <option value="TELEBIRR">Telebirr</option>
-        <option value="CBE">CBE Account</option>
-      </select>
-      <input type="number" class="input-field" id="wd-amount" placeholder="Amount (Min 50 BIRR)">
-      <input type="text" class="input-field" id="wd-acc" placeholder="Account / Phone Number">
-      <input type="text" class="input-field" id="wd-name" placeholder="Full Account Name">
-      <button class="btn btn-purple" onclick="submitWithdrawal()">Request Cashout</button>
-    </div>
-  </div>
-
-  <!-- TAB 4: HISTORY -->
-  <div id="tab-history" class="tab-content">
-    <div class="glass-card">
-      <h3 style="color: var(--gold-primary); margin-bottom: 12px;">Audit Ledger</h3>
-      <div id="history-list" style="font-size: 13px;">Loading transactions...</div>
-    </div>
-  </div>
-
-  <!-- Bottom App Navigation -->
-  <div class="nav-bar">
-    <div class="nav-item active" id="nav-play" onclick="switchTab('play')">
-      <svg viewBox="0 0 24 24"><path d="M21 6H3c-1.1 0-2 .9-2 2v8c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-10 7H8v3H6v-3H3v-2h3V8h2v3h3v2zm4.5 2c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm4-3c-.83 0-1.5-.67-1.5-1.5S18.67 9 19.5 9s1.5.67 1.5 1.5-.67 1.5-1.5 1.5z"/></svg>
-      Play
-    </div>
-    <div class="nav-item" id="nav-wallet" onclick="switchTab('wallet')">
-      <svg viewBox="0 0 24 24"><path d="M21 18v1c0 1.1-.9 2-2 2H5c-1.11 0-2-.9-2-2V5c0-1.1.89-2 2-2h14c1.1 0 2 .9 2 2v1h-9c-1.11 0-2 .9-2 2v8c0 1.1.89 2 2 2h9zm-9-2h10V8H12v8zm4-2.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5z"/></svg>
-      Wallet
-    </div>
-    <div class="nav-item" id="nav-history" onclick="switchTab('history')">
-      <svg viewBox="0 0 24 24"><path d="M13 3c-4.97 0-9 4.03-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42C8.27 19.99 10.51 21 13 21c4.97 0 9-4.03 9-9s-4.03-9-9-9zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg>
-      History
-    </div>
   </div>
 
   <script>
     const tg = window.Telegram?.WebApp;
-    if (tg) {
-      tg.expand();
-      tg.ready();
-    }
+    if (tg) { tg.expand(); tg.ready(); }
 
     const API_HEADERS = {
       'Content-Type': 'application/json',
       'Authorization': 'tma ' + (tg?.initData || '')
     };
 
+    const I18N = {
+      en: { play: "Play", wallet: "Wallet", history: "History", profile: "Profile", deposit: "Deposit", withdraw: "Withdraw", invite: "Invite", availableRooms: "Available Rooms" },
+      am: { play: "ተጫወት", wallet: "ዋሌት", history: "ታሪክ", profile: "መገለጫ", deposit: "ገንዘብ አስገባ", withdraw: "ገንዘብ አውጣ", invite: "ይጋብዙ", availableRooms: "የሚገኙ ክፍሎች" }
+    };
+    let currentLang = 'en';
+
+    function changeLanguage(lang) {
+      currentLang = lang;
+      document.querySelectorAll('[data-i18n]').forEach(el => {
+        const key = el.getAttribute('data-i18n');
+        if (I18N[lang] && I18N[lang][key]) el.innerText = I18N[lang][key];
+      });
+    }
+
     let activeRoomId = null;
     let selectedCartelaIds = [];
-    let gamePollInterval = null;
-    let activeGameCartelas = [];
+    let cartelasCatalog = [];
+    let gamePollTimer = null;
+    let lastSpokenNumber = null;
 
-    function switchTab(tab) {
-      document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-      document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-      document.getElementById('tab-' + tab).classList.add('active');
-      const navEl = document.getElementById('nav-' + tab);
-      if (navEl) navEl.classList.add('active');
+    function switchView(viewName) {
+      document.querySelectorAll('.screen-view').forEach(v => v.classList.remove('active'));
+      document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
 
-      if (tab === 'wallet') refreshWallet();
-      if (tab === 'history') loadHistory();
-      if (tab === 'play' && !activeRoomId) loadRooms();
+      const target = document.getElementById('view-' + viewName);
+      if (target) target.classList.add('active');
+
+      const navBtn = document.getElementById('nav-btn-' + viewName);
+      if (navBtn) navBtn.classList.add('active');
+
+      if (viewName === 'home') loadRooms();
+      if (viewName === 'wallet') refreshWallet();
+      if (viewName === 'history') loadHistory();
     }
 
     async function refreshWallet() {
@@ -1565,15 +1457,16 @@ function getMiniAppHTML() {
         const res = await fetch('/api/wallet', { headers: API_HEADERS });
         const data = await res.json();
         if (data.success) {
-          const balText = data.balance + ' BIRR';
-          document.getElementById('header-balance').innerText = balText;
-          document.getElementById('wallet-page-balance').innerText = balText;
+          const bal = data.balance + ' BIRR';
+          document.getElementById('header-wallet-bal').innerText = bal;
+          document.getElementById('wallet-balance-big').innerText = bal;
+          document.getElementById('prof-display-name').innerText = data.user.display_name;
+          document.getElementById('prof-tg-id').innerText = 'ID: ' + data.user.telegram_id;
         } else {
-          document.getElementById('header-balance').innerText = 'Wallet unavailable';
-          document.getElementById('wallet-page-balance').innerText = 'Wallet unavailable';
+          document.getElementById('header-wallet-bal').innerText = 'Unavailable';
         }
       } catch (e) {
-        document.getElementById('header-balance').innerText = 'Offline';
+        document.getElementById('header-wallet-bal').innerText = 'Offline';
       }
     }
 
@@ -1581,73 +1474,105 @@ function getMiniAppHTML() {
       try {
         const res = await fetch('/api/rooms', { headers: API_HEADERS });
         const data = await res.json();
-        const container = document.getElementById('rooms-container');
+        const container = document.getElementById('rooms-feed-list');
         container.innerHTML = '';
 
         if (!data.rooms || data.rooms.length === 0) {
-          container.innerHTML = '<div class="glass-card">No waiting rooms available. Refresh in a moment.</div>';
+          container.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-muted);">No active rooms. Waiting for players...</div>';
           return;
         }
 
         data.rooms.forEach(r => {
           const pot = (r.selected_cartelas * r.stake).toFixed(2);
           const div = document.createElement('div');
-          div.className = 'glass-card room-card';
+          div.className = 'room-card-v2';
           div.innerHTML = \`
             <div>
-              <div class="room-title">ROOM #\${r.room_number}</div>
-              <div class="room-meta">Stake: \${r.stake} BIRR | Players: \${r.current_players}/\${r.capacity}</div>
-              <div class="room-meta">Total Pot: \${pot} BIRR</div>
+              <div class="room-header-tag">🎱 ROOM #\${r.room_number}</div>
+              <div class="room-specs">
+                <span>Stake: <strong>\${r.stake} BIRR</strong></span>
+                <span>Players: <strong>\${r.current_players}/\${r.capacity}</strong></span>
+                <span>Pot: <strong>\${pot} BIRR</strong></span>
+              </div>
             </div>
-            <button class="btn btn-gold" style="width: auto; padding: 10px 20px;" onclick="enterRoom(\${r.id})">ENTER</button>
+            <button class="btn-gold-cta" onclick="openRoomPicker(\${r.id}, \${r.room_number})">JOIN +</button>
           \`;
           container.appendChild(div);
         });
-      } catch(e) {
-        console.error(e);
+      } catch (e) {
+        console.error('Room load error', e);
       }
     }
 
-    async function enterRoom(roomId) {
+    async function openRoomPicker(roomId, roomNumber) {
       activeRoomId = roomId;
       selectedCartelaIds = [];
+      document.getElementById('picker-room-info').innerText = 'Room #' + roomNumber;
+      updatePurchaseSummary();
+
       const res = await fetch('/api/cartelas?roomId=' + roomId, { headers: API_HEADERS });
       const data = await res.json();
-      
-      const container = document.getElementById('rooms-container');
-      container.innerHTML = \`
-        <div class="glass-card">
-          <h3>Select Cartelas (Max 2)</h3>
-          <p style="color: var(--text-muted); font-size: 13px;">Cost: 10 BIRR per cartela</p>
-          <div class="cartela-picker-container" id="cartela-selector-grid"></div>
-          <button class="btn btn-gold" style="margin-top: 16px;" onclick="purchaseSelectedCartelas()">Confirm & Buy</button>
-        </div>
-      \`;
+      cartelasCatalog = data.cartelas || [];
 
-      const grid = document.getElementById('cartela-selector-grid');
-      data.cartelas.slice(0, 20).forEach(c => {
+      const grid = document.getElementById('cartela-selectable-feed');
+      grid.innerHTML = '';
+
+      cartelasCatalog.slice(0, 16).forEach(c => {
         const isTaken = data.takenCartelaIds.includes(c.id);
-        const isMine = data.myCartelaIds.includes(c.id);
-        const item = document.createElement('div');
-        item.className = 'cartela-item' + (isTaken ? ' taken' : '') + (isMine ? ' selected' : '');
-        item.innerText = 'Cartela #' + c.cartela_number;
-        if (!isTaken) {
-          item.onclick = () => {
-            if (selectedCartelaIds.includes(c.id)) {
-              selectedCartelaIds = selectedCartelaIds.filter(id => id !== c.id);
-              item.classList.remove('selected');
-            } else {
-              if (selectedCartelaIds.length >= 2) return alert('Max 2 cartelas allowed');
-              selectedCartelaIds.push(c.id);
-              item.classList.add('selected');
-            }
-          };
+        const card = document.createElement('div');
+        card.className = 'ticket-card' + (isTaken ? ' taken' : '');
+        card.id = 'cartela-card-' + c.id;
+
+        const matrix = typeof c.matrix === 'string' ? JSON.parse(c.matrix) : c.matrix;
+        let miniMatrixHtml = '';
+        for (let r = 0; r < 5; r++) {
+          for (let col = 0; col < 5; col++) {
+            const v = matrix[r][col];
+            miniMatrixHtml += \`<div class="mini-cell \${v === 0 ? 'free-cell' : ''}">\${v === 0 ? 'F' : v}</div>\`;
+          }
         }
-        grid.appendChild(item);
+
+        card.innerHTML = \`
+          <div class="ticket-header">
+            <span>Ticket #\${c.cartela_number}</span>
+            <span>\${isTaken ? 'TAKEN' : '10 B'}</span>
+          </div>
+          <div class="ticket-mini-matrix">\${miniMatrixHtml}</div>
+        \`;
+
+        if (!isTaken) {
+          card.onclick = () => toggleCartelaSelection(c.id);
+        }
+        grid.appendChild(card);
       });
+
+      switchView('cartela-picker');
     }
 
-    async function purchaseSelectedCartelas() {
+    function toggleCartelaSelection(cartelaId) {
+      const idx = selectedCartelaIds.indexOf(cartelaId);
+      const el = document.getElementById('cartela-card-' + cartelaId);
+
+      if (idx > -1) {
+        selectedCartelaIds.splice(idx, 1);
+        el.classList.remove('selected');
+      } else {
+        if (selectedCartelaIds.length >= 2) {
+          alert('Maximum 2 cartelas allowed per game.');
+          return;
+        }
+        selectedCartelaIds.push(cartelaId);
+        el.classList.add('selected');
+      }
+      updatePurchaseSummary();
+    }
+
+    function updatePurchaseSummary() {
+      document.getElementById('summary-cartela-count').innerText = selectedCartelaIds.length + ' / 2';
+      document.getElementById('summary-total-cost').innerText = (selectedCartelaIds.length * 10).toFixed(2) + ' BIRR';
+    }
+
+    async function confirmCartelaPurchase() {
       if (selectedCartelaIds.length === 0) return alert('Select at least 1 cartela');
       try {
         const res = await fetch('/api/cartela/purchase', {
@@ -1658,23 +1583,61 @@ function getMiniAppHTML() {
         const data = await res.json();
         if (data.success) {
           await refreshWallet();
-          startLiveGameEngine();
+          launchLiveGameSession();
         } else {
           alert('Purchase failed: ' + data.message);
         }
       } catch (e) {
-        alert('Network error during purchase');
+        alert('Network error during purchase.');
       }
     }
 
-    function startLiveGameEngine() {
-      switchTab('game');
-      if (gamePollInterval) clearInterval(gamePollInterval);
-      gamePollInterval = setInterval(pollGameState, 1800);
-      pollGameState();
+    function launchLiveGameSession() {
+      switchView('live-game');
+      renderLiveCartelas();
+      if (gamePollTimer) clearInterval(gamePollTimer);
+      gamePollTimer = setInterval(pollLiveGameState, 1800);
+      pollLiveGameState();
     }
 
-    async function pollGameState() {
+    function renderLiveCartelas() {
+      const container = document.getElementById('live-cartelas-container');
+      container.innerHTML = '';
+
+      selectedCartelaIds.forEach(cId => {
+        const item = cartelasCatalog.find(c => c.id === cId);
+        if (!item) return;
+        const matrix = typeof item.matrix === 'string' ? JSON.parse(item.matrix) : item.matrix;
+
+        const board = document.createElement('div');
+        board.className = 'cartela-board';
+        board.id = 'live-board-' + cId;
+
+        let cellsHtml = '';
+        ['B', 'I', 'N', 'G', 'O'].forEach(l => {
+          cellsHtml += \`<div class="col-letter">\${l}</div>\`;
+        });
+
+        for (let r = 0; r < 5; r++) {
+          for (let c = 0; c < 5; c++) {
+            const val = matrix[r][c];
+            if (val === 0) {
+              cellsHtml += \`<div class="cell-val free-spot" data-cell="0">FREE</div>\`;
+            } else {
+              cellsHtml += \`<div class="cell-val" data-cell="\${val}">\${val}</div>\`;
+            }
+          }
+        }
+
+        board.innerHTML = \`
+          <div class="board-header">Cartela #\${item.cartela_number}</div>
+          <div class="matrix-5x5">\${cellsHtml}</div>
+        \`;
+        container.appendChild(board);
+      });
+    }
+
+    async function pollLiveGameState() {
       if (!activeRoomId) return;
       try {
         const res = await fetch('/api/game/state?roomId=' + activeRoomId, { headers: API_HEADERS });
@@ -1682,32 +1645,71 @@ function getMiniAppHTML() {
         if (!data.success) return;
 
         const gs = data.gameState;
-        document.getElementById('display-call').innerText = gs.currentNumber || '-';
-        document.getElementById('display-timer').innerText = gs.status === 'PLAYING' 
-          ? 'Next call in: ' + gs.nextCallInSeconds + 's' 
+        document.getElementById('game-pot-val').innerText = gs.prizePool || '0';
+        document.getElementById('game-call-index').innerText = gs.calledNumbers ? gs.calledNumbers.length : '0';
+        document.getElementById('game-next-timer').innerText = gs.status === 'PLAYING' 
+          ? 'Next Call: ' + gs.nextCallInSeconds + 's' 
           : 'Status: ' + gs.status;
 
-        // Render ribbon
-        const ribbon = document.getElementById('called-history');
+        // Current Ball
+        if (gs.currentNumber) {
+          const num = gs.currentNumber;
+          let letter = 'B';
+          if (num > 15 && num <= 30) letter = 'I';
+          if (num > 30 && num <= 45) letter = 'N';
+          if (num > 45 && num <= 60) letter = 'G';
+          if (num > 60) letter = 'O';
+
+          document.getElementById('current-ball-letter').innerText = letter;
+          document.getElementById('current-ball-number').innerText = num;
+
+          // Audio Speech Synthesizer
+          if (document.getElementById('setting-voice').checked && lastSpokenNumber !== num) {
+            lastSpokenNumber = num;
+            if ('speechSynthesis' in window) {
+              const utter = new SpeechSynthesisUtterance(letter + ' ' + num);
+              utter.rate = 1.1;
+              window.speechSynthesis.speak(utter);
+            }
+          }
+        }
+
+        // Recent Numbers Ribbon
+        const ribbon = document.getElementById('recent-calls-ribbon');
         ribbon.innerHTML = '';
-        (gs.calledNumbers || []).slice(-8).reverse().forEach(num => {
-          const pill = document.createElement('div');
-          pill.className = 'ribbon-pill';
-          pill.innerText = num;
-          ribbon.appendChild(pill);
+        const called = gs.calledNumbers || [];
+        called.slice(-7).reverse().forEach(n => {
+          const p = document.createElement('div');
+          p.className = 'recent-pill';
+          p.innerText = n;
+          ribbon.appendChild(p);
         });
 
-        if (gs.status === 'FINISHED' && gs.winners?.length > 0) {
-          clearInterval(gamePollInterval);
-          alert('GAME OVER! Winner: ' + gs.winners.map(w => w.display_name + ' (#' + w.cartela_number + ')').join(', '));
+        // Mark Matching Cells on all rendered boards
+        const calledSet = new Set(called);
+        document.querySelectorAll('.cell-val').forEach(cell => {
+          const v = parseInt(cell.getAttribute('data-cell'), 10);
+          if (v !== 0 && calledSet.has(v)) {
+            cell.classList.add('marked');
+          }
+        });
+
+        // Winner Detected
+        if (gs.status === 'FINISHED' && gs.winners && gs.winners.length > 0) {
+          clearInterval(gamePollTimer);
+          const w = gs.winners[0];
+          document.getElementById('win-modal-pot').innerText = gs.prizePool + ' BIRR';
+          document.getElementById('win-modal-winner-name').innerText = 'Winner: ' + w.display_name;
+          document.getElementById('win-modal-cartela-num').innerText = 'Cartela: #' + w.cartela_number;
+          document.getElementById('winner-modal').classList.add('active');
           await refreshWallet();
         }
       } catch (e) {
-        console.error('Game poll failed:', e);
+        console.error('Poll error', e);
       }
     }
 
-    async function submitBingoClaim() {
+    async function claimBingoVictory() {
       if (!activeRoomId || selectedCartelaIds.length === 0) return;
       try {
         const res = await fetch('/api/game/bingo', {
@@ -1717,20 +1719,28 @@ function getMiniAppHTML() {
         });
         const data = await res.json();
         if (data.success) {
-          alert('🎉 BINGO VERIFIED! Prize: ' + data.prizeAmount + ' BIRR');
+          document.getElementById('win-modal-pot').innerText = data.prizeAmount + ' BIRR';
+          document.getElementById('win-modal-winner-name').innerText = 'You Won!';
+          document.getElementById('win-modal-cartela-num').innerText = 'Cartela: #' + data.cartelaNumber;
+          document.getElementById('winner-modal').classList.add('active');
           await refreshWallet();
         } else {
           alert('Bingo claim rejected: ' + data.message);
         }
       } catch (e) {
-        alert('Error verifying bingo');
+        alert('Verification error.');
       }
     }
 
-    async function submitDeposit() {
-      const amount = document.getElementById('dep-amount').value;
-      const paymentMethod = document.getElementById('dep-method').value;
-      const transactionId = document.getElementById('dep-txid').value;
+    function closeWinnerModal() {
+      document.getElementById('winner-modal').classList.remove('active');
+      switchView('home');
+    }
+
+    async function submitDepositOrder() {
+      const amount = document.getElementById('inp-dep-amt').value;
+      const paymentMethod = document.getElementById('inp-dep-method').value;
+      const transactionId = document.getElementById('inp-dep-txid').value;
 
       const res = await fetch('/api/deposit', {
         method: 'POST',
@@ -1739,19 +1749,19 @@ function getMiniAppHTML() {
       });
       const data = await res.json();
       if (data.success) {
-        alert('Deposit request submitted! Awaiting Admin verification.');
-        document.getElementById('dep-amount').value = '';
-        document.getElementById('dep-txid').value = '';
+        alert('Deposit order queued for verification.');
+        document.getElementById('inp-dep-amt').value = '';
+        document.getElementById('inp-dep-txid').value = '';
       } else {
-        alert('Deposit error: ' + data.message);
+        alert('Error: ' + data.message);
       }
     }
 
-    async function submitWithdrawal() {
-      const amount = document.getElementById('wd-amount').value;
-      const paymentMethod = document.getElementById('wd-method').value;
-      const accountNumber = document.getElementById('wd-acc').value;
-      const accountHolder = document.getElementById('wd-name').value;
+    async function submitWithdrawOrder() {
+      const amount = document.getElementById('inp-wd-amt').value;
+      const paymentMethod = document.getElementById('inp-wd-method').value;
+      const accountNumber = document.getElementById('inp-wd-acc').value;
+      const accountHolder = document.getElementById('inp-wd-name').value;
 
       const res = await fetch('/api/withdraw', {
         method: 'POST',
@@ -1760,37 +1770,44 @@ function getMiniAppHTML() {
       });
       const data = await res.json();
       if (data.success) {
-        alert('Withdrawal queued successfully.');
+        alert('Withdrawal request placed successfully.');
         await refreshWallet();
       } else {
-        alert('Withdrawal failed: ' + data.message);
+        alert('Error: ' + data.message);
       }
     }
 
     async function loadHistory() {
-      const container = document.getElementById('history-list');
+      const list = document.getElementById('history-audit-list');
       try {
         const res = await fetch('/api/history', { headers: API_HEADERS });
         const data = await res.json();
         if (!data.transactions || data.transactions.length === 0) {
-          container.innerHTML = 'No history records found.';
+          list.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:16px;">No transactions recorded.</div>';
           return;
         }
-        container.innerHTML = data.transactions.map(t => \`
-          <div style="padding: 8px 0; border-bottom: 1px solid var(--border-glass);">
-            <div style="display:flex; justify-content:space-between; font-weight:700;">
+        list.innerHTML = data.transactions.map(t => \`
+          <div style="background:var(--bg-card); border:1px solid var(--bg-card-border); border-radius:12px; padding:10px 14px; margin-bottom:8px;">
+            <div style="display:flex; justify-content:space-between; font-weight:800; font-size:13px;">
               <span>\${t.type}</span>
-              <span style="color:var(--gold-primary);">\${t.amount} BIRR</span>
+              <span style="color:var(--bright-gold);">\${t.amount} BIRR</span>
             </div>
-            <div style="color:var(--text-muted); font-size:11px;">Bal after: \${t.balance_after} BIRR | \${new Date(t.created_at).toLocaleDateString()}</div>
+            <div style="font-size:11px; color:var(--text-secondary); margin-top:2px;">Bal: \${t.balance_after} BIRR | \${new Date(t.created_at).toLocaleDateString()}</div>
           </div>
         \`).join('');
       } catch (e) {
-        container.innerHTML = 'Failed to load history.';
+        list.innerHTML = 'Error loading history.';
       }
     }
 
-    // Initialize application
+    function copyInviteLink() {
+      const copyText = document.getElementById("invite-link-input");
+      copyText.select();
+      copyText.setSelectionRange(0, 99999);
+      navigator.clipboard.writeText(copyText.value);
+      alert("Invite link copied to clipboard!");
+    }
+
     window.addEventListener('load', async () => {
       await refreshWallet();
       await loadRooms();
@@ -1801,42 +1818,36 @@ function getMiniAppHTML() {
 }
 
 // ============================================================================
-// 13. HTTP RUNTIME / VERCEL COMPATIBLE SERVERLESS HANDLER
+// 12. RUNTIME SERVERLESS / HTTP HANDLER
 // ============================================================================
 async function appHandler(req, res) {
-  // Ensure idempotent database initialization
   try {
     await initDatabase();
   } catch (err) {
-    console.error('Database connection failed:', err);
+    console.error('Database connection error:', err);
   }
 
   const parsedUrl = url.parse(req.url, true);
 
-  // Serve Embedded Mini App SPA
   if (req.method === 'GET' && (parsedUrl.pathname === '/' || parsedUrl.pathname === '')) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end(getMiniAppHTML());
   }
 
-  // Route API Requests
   if (parsedUrl.pathname.startsWith('/api/')) {
     return handleApiRequest(req, res, parsedUrl);
   }
 
-  // Fallback 404
   res.writeHead(404, { 'Content-Type': 'text/plain' });
   res.end('Not Found');
 }
 
-// Export for Vercel Serverless Function engine
 module.exports = appHandler;
 
-// Standalone execution for local development
 if (require.main === module) {
   const PORT = process.env.PORT || 3000;
   const server = http.createServer(appHandler);
   server.listen(PORT, () => {
-    console.log(`Shisho Bingo active on http://localhost:${PORT}`);
+    console.log(`Shisho Bingo running on http://localhost:${PORT}`);
   });
 }
